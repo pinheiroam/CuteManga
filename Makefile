@@ -52,13 +52,16 @@ ICON        :=  Icon.jpg
 #---------------------------------------------------------------------------------
 ARCH	:=	-march=armv8-a -mtune=cortex-a57 -mtp=soft -fPIE
 
+# Use pkg-config for freetype (no freetype-config in switch portlibs)
+PKG_CONFIG	:=	$(PORTLIBS)/bin/aarch64-none-elf-pkg-config
+
 CFLAGS	:=	-g -O3 -ffunction-sections \
 			-Wall -Wno-write-strings \
 			$(ARCH) $(DEFINES) \
 			-DVERSION_MAJOR=${VERSION_MAJOR} \
 			-DVERSION_MINOR=${VERSION_MINOR} \
 			-DVERSION_MICRO=${VERSION_MICRO} \
-			`freetype-config --cflags` \
+			$(shell $(PKG_CONFIG) --cflags freetype2) \
 			`sdl2-config --cflags`
 
 CFLAGS	+=	$(INCLUDE) -D__SWITCH__ -D_GNU_SOURCE=1
@@ -68,7 +71,11 @@ CXXFLAGS	:= $(CFLAGS) -fno-rtti -fno-exceptions -std=gnu++17
 ASFLAGS	:=	-g $(ARCH)
 LDFLAGS	=	-specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH) -Wl,-no-as-needed,-Map,$(notdir $*.map)
 
-LIBS	:=	-lSDL2_ttf -lSDL2_gfx -lSDL2_image -lpng -lwebp -ljpeg `sdl2-config --libs` `freetype-config --libs` -lcurl -lmbedtls -lmbedx509 -lmbedcrypto -lz -lnx
+# switch-curl in devkitPro is built without mbedtls (no libmbedtls in portlibs/switch)
+# MuPDF for CBZ: build with make -C libs -f Makefile.mupdf (see SETUP.md)
+# MuPDF may build only libmupdf.a when thirdparty is empty (html=no, jbig2=no, etc.); add -lmupdf-third only if present
+MUPDF_THIRD := $(if $(wildcard $(TOPDIR)/libs/mupdf/lib/libmupdf-third.a),-lmupdf-third,)
+LIBS	:=	-lSDL2_ttf -lSDL2_gfx -lSDL2_image -lpng -lwebp -ljpeg `sdl2-config --libs` $(shell $(PKG_CONFIG) --libs freetype2) -lcurl -lmupdf $(MUPDF_THIRD) -lm -lz -lnx
 #LIBS     := -lSDL2_ttf -lSDL2_image -lSDL2_mixer -lSDL2 -lSDL2_gfx \
 #			-lpng  -ljpeg \
 #			-lglad -lEGL -lglapi -ldrm_nouveau \
@@ -81,8 +88,17 @@ LIBS	:=	-lSDL2_ttf -lSDL2_gfx -lSDL2_image -lpng -lwebp -ljpeg `sdl2-config --li
 #---------------------------------------------------------------------------------
 # list of directories containing libraries, this must be the top level containing
 # include and lib
+# MuPDF: must clone and build first. From project root:
+#   git clone --depth 1 https://github.com/ArtifexSoftware/mupdf.git libs/mupdf
+#   make -C libs -f Makefile.mupdf
 #---------------------------------------------------------------------------------
-LIBDIRS	:= $(PORTLIBS) $(LIBNX)
+MUPDF_ROOT := $(TOPDIR)/libs/mupdf
+MUPDF_INC  := $(MUPDF_ROOT)/include
+ifeq (,$(wildcard $(MUPDF_INC)/mupdf/fitz.h))
+$(error MuPDF not found. Clone and build it first (from project root): \
+  git clone --depth 1 https://github.com/ArtifexSoftware/mupdf.git libs/mupdf && make -C libs -f Makefile.mupdf)
+endif
+LIBDIRS	:= $(PORTLIBS) $(LIBNX) $(MUPDF_ROOT)
 
 
 #---------------------------------------------------------------------------------
@@ -129,6 +145,8 @@ export INCLUDE	:=	$(foreach dir,$(INCLUDES),-I$(CURDIR)/$(dir)) \
 			-I$(CURDIR)/$(BUILD)
 
 export LIBPATHS	:=	$(foreach dir,$(LIBDIRS),-L$(dir)/lib)
+export LIBS
+export LDFLAGS
 
 export BUILD_EXEFS_SRC := $(TOPDIR)/$(EXEFS_SRC)
 

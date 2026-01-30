@@ -1,0 +1,52 @@
+# Build MuPDF for Nintendo Switch (used by CuteManga for CBZ support).
+# Prerequisites: MuPDF source in libs/mupdf (e.g. git clone https://github.com/ArtifexSoftware/mupdf.git libs/mupdf)
+# Run from project root: make -C libs -f Makefile.mupdf
+# Or from libs: make -f Makefile.mupdf
+
+ifeq ($(strip $(DEVKITPRO)),)
+$(error "Set DEVKITPRO. Run from devkitPro MSYS or: export DEVKITPRO=/opt/devkitpro")
+endif
+
+TOPDIR ?= $(CURDIR)/..
+ifeq ($(shell test -d $(TOPDIR)/libs/mupdf && echo 1),)
+$(error "MuPDF source not found. From project root: git clone --depth 1 https://github.com/ArtifexSoftware/mupdf.git libs/mupdf")
+endif
+
+include $(DEVKITPRO)/libnx/switch_rules
+TOOL_PREFIX := $(DEVKITPRO)/devkitA64/bin/aarch64-none-elf-
+
+ARCH := -march=armv8-a -mtune=cortex-a57 -mtp=soft -fPIE
+# Portlibs include path so MuPDF finds zlib.h, jpeg, etc. when USE_SYSTEM_*=yes
+# FreeType2 installs ft2build.h under include/freetype2/
+# HAVE_FT_GET_FSTYPE_FLAGS=0: Switch portlibs FreeType may not have FT_Get_FSType_Flags
+CFLAGS_SWITCH := -g -O2 -ffunction-sections $(ARCH) -D__SWITCH__ -DHAVE_FT_GET_FSTYPE_FLAGS=0 -I$(PORTLIBS)/include -I$(PORTLIBS)/include/freetype2
+
+.PHONY: mupdf
+
+mupdf:
+	@echo "Building MuPDF for Switch..."
+	@mkdir -p $(TOPDIR)/libs/mupdf/lib
+	$(MAKE) -C $(TOPDIR)/libs/mupdf \
+		CC="$(TOOL_PREFIX)gcc" \
+		CXX="$(TOOL_PREFIX)g++" \
+		AR="$(TOOL_PREFIX)ar" \
+		RANLIB="$(TOOL_PREFIX)ranlib" \
+		XCFLAGS="$(CFLAGS_SWITCH)" \
+		brotli=no \
+		mujs=no \
+		icc=no \
+		jpx=no \
+		jbig2=no \
+		html=no \
+		extract=no \
+		USE_SYSTEM_FREETYPE=yes \
+		USE_SYSTEM_HARFBUZZ=no \
+		USE_SYSTEM_LIBJPEG=yes \
+		USE_SYSTEM_ZLIB=yes \
+		USE_SYSTEM_OPENJPEG=no \
+		USE_SYSTEM_LCMS2=no \
+		build=release \
+		libs
+	@cp -f $(TOPDIR)/libs/mupdf/build/release/libmupdf.a $(TOPDIR)/libs/mupdf/lib/ 2>/dev/null || true
+	@cp -f $(TOPDIR)/libs/mupdf/build/release/libmupdf-third.a $(TOPDIR)/libs/mupdf/lib/ 2>/dev/null || true
+	@echo "MuPDF built. libs in $(TOPDIR)/libs/mupdf/lib/"

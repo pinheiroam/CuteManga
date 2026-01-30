@@ -26,9 +26,10 @@
 #include <string>
 #include <cmath>
 #include <iostream>
-#include <math.h>  
-#include <Vector>
+#include <math.h>
+#include <vector>
 #include <dirent.h>
+#include <mupdf/fitz.h>
 
 // Empty strings are invalid.
 #ifdef __SWITCH__
@@ -89,6 +90,11 @@ bool	isFileExist(const char *file)
 //Screen dimension constants
 const int SCREEN_WIDTH = 1280;
 const int SCREEN_HEIGHT = 720;
+// Portrait mode: logical view size (swap when portrait); render to texture then rotate to screen
+int g_view_w = SCREEN_WIDTH;
+int g_view_h = SCREEN_HEIGHT;
+bool g_portrait_mode = false;
+SDL_Texture* g_portrait_texture = NULL;
 enum states { selectmanga, readmanga };
 int statenow = selectmanga;
 std::string  urltodownload = "";
@@ -123,6 +129,10 @@ public:
 	//Loads image at specified path
 	bool loadFromFile(std::string path);
 	bool loadFromFileCustom(std::string path,int h, int w);
+	//Loads image from memory (for CBZ/ZIP archives)
+	bool loadFromMemory(const void* buf, int size);
+	//Loads from raw RGB/RGBA (e.g. MuPDF pixmap: data, w, h, stride, n=3 or 4)
+	bool loadFromRGB(const unsigned char* data, int w, int h, int stride, int n);
 	//Creates image from font string
 	bool loadFromRenderedText(TTF_Font *fuente, std::string textureText, SDL_Color textColor);
 	//Creates image from font string
@@ -159,6 +169,21 @@ private:
 
 //Frees media and shuts down SDL
 void close();
+
+// CBZ loading progress (0-100, message)
+int g_loading_pct = 0;
+std::string g_loading_msg;
+void renderLoadingProgress();
+
+// CBZ open failure reason for UI
+enum { CBZ_ERR_NONE = 0, CBZ_ERR_FILE_NOT_FOUND = 1, CBZ_ERR_NOT_ZIP = 2 };
+int g_cbz_open_error = CBZ_ERR_NONE;
+std::string g_cbz_mupdf_error;  // MuPDF error message when CBZ_ERR_NOT_ZIP
+
+// MuPDF: context (created at init), current CBZ document (open while viewing)
+fz_context* g_mupdf_ctx = NULL;
+fz_document* g_mupdf_doc = NULL;
+std::string g_mupdf_path;
 
 //The window we'll be rendering to
 SDL_Window* gWindow = NULL;
@@ -276,6 +301,43 @@ bool LTexture::loadFromFileCustom(std::string path, int h, int w)
 	mTexture = newTexture;
 	return mTexture != NULL;
 }
+
+bool LTexture::loadFromMemory(const void* buf, int size)
+{
+	free();
+	SDL_Texture* newTexture = NULL;
+	SDL_RWops* rw = SDL_RWFromConstMem(buf, size);
+	if (!rw) return false;
+	SDL_Surface* loadedSurface = IMG_Load_RW(rw, 1);
+	if (!loadedSurface) return false;
+	SDL_SetColorKey(loadedSurface, SDL_TRUE, SDL_MapRGB(loadedSurface->format, 0, 0xFF, 0xFF));
+	newTexture = SDL_CreateTextureFromSurface(gRenderer, loadedSurface);
+	if (newTexture) {
+		mWidth = loadedSurface->w;
+		mHeight = loadedSurface->h;
+	}
+	SDL_FreeSurface(loadedSurface);
+	mTexture = newTexture;
+	return mTexture != NULL;
+}
+
+bool LTexture::loadFromRGB(const unsigned char* data, int w, int h, int stride, int n) {
+	free();
+	if (!data || w <= 0 || h <= 0 || stride < w * n) return false;
+	SDL_Surface* surf = NULL;
+	if (n == 3) {
+		surf = SDL_CreateRGBSurfaceFrom((void*)data, w, h, 24, stride, 0x000000FF, 0x0000FF00, 0x00FF0000, 0);
+	} else if (n == 4) {
+		surf = SDL_CreateRGBSurfaceFrom((void*)data, w, h, 32, stride, 0x000000FF, 0x0000FF00, 0x00FF0000, 0xFF000000);
+	} else return false;
+	if (!surf) return false;
+	SDL_Texture* newTexture = SDL_CreateTextureFromSurface(gRenderer, surf);
+	if (newTexture) { mWidth = w; mHeight = h; }
+	SDL_FreeSurface(surf);
+	mTexture = newTexture;
+	return mTexture != NULL;
+}
+
 bool LTexture::loadFromRenderedText(TTF_Font *fuente, std::string textureText, SDL_Color textColor)
 {
 	//Get rid of preexisting texture
@@ -416,9 +478,162 @@ int LTexture::getHeight()
 	return mHeight;
 }
 
+//-----------------------------------------------------------------------------
+// CBZ support via MuPDF - open, list pages, render to texture
+//-----------------------------------------------------------------------------
 
+// Natural sort: "Batman 001" < "Batman 002" < "Batman 010" (numeric order, not alphabetical)
+static bool naturalSortCompare(const std::string& a, const std::string& b) {
+	size_t i = 0, j = 0;
+	while (i < a.size() && j < b.size()) {
+		bool aDig = (a[i] >= '0' && a[i] <= '9');
+		bool bDig = (b[j] >= '0' && b[j] <= '9');
+		if (aDig && bDig) {
+			unsigned long long na = 0, nb = 0;
+			while (i < a.size() && a[i] >= '0' && a[i] <= '9') { na = na * 10 + (a[i] - '0'); i++; }
+			while (j < b.size() && b[j] >= '0' && b[j] <= '9') { nb = nb * 10 + (b[j] - '0'); j++; }
+			if (na != nb) return na < nb;
+			continue;
+		}
+		if (aDig != bDig) return a[i] < b[j];
+		if ((unsigned char)a[i] != (unsigned char)b[j]) return (unsigned char)a[i] < (unsigned char)b[j];
+		i++; j++;
+	}
+	/* a is prefix of b -> a < b; otherwise a >= b */
+	return (i >= a.size() && j < b.size());
+}
 
+typedef void (*CbzProgressFn)(int pct, const char* msg);
 
+static void cbzProgressUpdate(int pct, const char* msg) {
+	g_loading_pct = pct;
+	g_loading_msg = msg ? msg : "";
+	renderLoadingProgress();
+}
+
+// Open CBZ with MuPDF; sets g_mupdf_doc and g_mupdf_path. Returns page count or -1 on error.
+static int openCbzWithMupdf(const char* cbzPath) {
+	g_cbz_open_error = CBZ_ERR_NONE;
+	g_cbz_mupdf_error.clear();
+	if (!g_mupdf_ctx) return -1;
+	if (g_mupdf_doc) { fz_drop_document(g_mupdf_ctx, g_mupdf_doc); g_mupdf_doc = NULL; }
+	g_mupdf_path.clear();
+	const char* pathToOpen = cbzPath;
+#ifdef __SWITCH__
+	FILE* test = fopen(cbzPath, "rb");
+	if (test) {
+		fclose(test);
+	} else if (strncmp(cbzPath, "sdmc:/", 6) == 0) {
+		test = fopen(cbzPath + 6, "rb");
+		if (!test) { g_cbz_open_error = CBZ_ERR_FILE_NOT_FOUND; return -1; }
+		fclose(test);
+		pathToOpen = cbzPath + 6;  // MuPDF needs the path that fopen accepts
+	} else {
+		g_cbz_open_error = CBZ_ERR_FILE_NOT_FOUND;
+		return -1;
+	}
+#endif
+	fz_try(g_mupdf_ctx) {
+		g_mupdf_doc = fz_open_document(g_mupdf_ctx, pathToOpen);
+		if (!g_mupdf_doc) fz_throw(g_mupdf_ctx, FZ_ERROR_GENERIC, "open failed");
+		g_mupdf_path = cbzPath;
+	}
+	fz_catch(g_mupdf_ctx) {
+		if (g_mupdf_doc) { fz_drop_document(g_mupdf_ctx, g_mupdf_doc); g_mupdf_doc = NULL; }
+		g_cbz_open_error = CBZ_ERR_NOT_ZIP;
+		const char* msg = fz_caught_message(g_mupdf_ctx);
+		g_cbz_mupdf_error = msg ? msg : "unknown error";
+		return -1;
+	}
+	return fz_count_pages(g_mupdf_ctx, g_mupdf_doc);
+}
+
+// List "pages" for CBZ: returns count; caller fills arraychapter with cbz:path:0, cbz:path:1, ...
+static int listPagesFromCbz(const char* cbzPath, CbzProgressFn onProgress = nullptr) {
+	if (onProgress) { onProgress(10, "Opening CBZ..."); renderLoadingProgress(); }
+	int n = openCbzWithMupdf(cbzPath);
+	if (onProgress && n > 0) { onProgress(50, "Ready."); renderLoadingProgress(); }
+	return n;
+}
+
+// Render CBZ page (0-based) into texture. g_mupdf_doc must be open for this path.
+static bool loadCbzPageIntoTexture(const char* cbzPath, int pageIndex, LTexture* tex) {
+	if (!g_mupdf_ctx || !g_mupdf_doc || g_mupdf_path != cbzPath) return false;
+	int npages = fz_count_pages(g_mupdf_ctx, g_mupdf_doc);
+	if (pageIndex < 0 || pageIndex >= npages) return false;
+	fz_page* page = NULL;
+	fz_pixmap* pix = NULL;
+	fz_device* dev = NULL;
+	bool ok = false;
+	fz_try(g_mupdf_ctx) {
+		page = fz_load_page(g_mupdf_ctx, g_mupdf_doc, pageIndex);
+		fz_rect bounds = fz_bound_page(g_mupdf_ctx, page);
+		/* Scale 2x for higher quality; device must use identity so ctm is not applied twice */
+		float scale = 2.0f;
+		fz_matrix ctm = fz_scale(scale, scale);
+		fz_rect rect = fz_transform_rect(bounds, ctm);
+		fz_irect bbox = fz_round_rect(rect);
+		pix = fz_new_pixmap_with_bbox(g_mupdf_ctx, fz_device_rgb(g_mupdf_ctx), bbox, NULL, 1);
+		fz_clear_pixmap_with_value(g_mupdf_ctx, pix, 0xff);
+		dev = fz_new_draw_device(g_mupdf_ctx, fz_identity, pix);
+		fz_run_page(g_mupdf_ctx, page, dev, ctm, NULL);
+		fz_close_device(g_mupdf_ctx, dev);
+		fz_drop_device(g_mupdf_ctx, dev);
+		dev = NULL;
+		fz_drop_page(g_mupdf_ctx, page);
+		page = NULL;
+		int w = fz_pixmap_width(g_mupdf_ctx, pix);
+		int h = fz_pixmap_height(g_mupdf_ctx, pix);
+		int stride = fz_pixmap_stride(g_mupdf_ctx, pix);
+		int n = fz_pixmap_components(g_mupdf_ctx, pix);
+		unsigned char* samples = fz_pixmap_samples(g_mupdf_ctx, pix);
+		ok = tex->loadFromRGB(samples, w, h, stride, n);
+		fz_drop_pixmap(g_mupdf_ctx, pix);
+		pix = NULL;
+	}
+	fz_catch(g_mupdf_ctx) {
+		if (dev) fz_drop_device(g_mupdf_ctx, dev);
+		if (page) fz_drop_page(g_mupdf_ctx, page);
+		if (pix) fz_drop_pixmap(g_mupdf_ctx, pix);
+	}
+	return ok;
+}
+
+// Load a page from arraychapter entry (file path or "cbz:path:pageIndex")
+static void loadPageIntoTexture(const std::string& entry, LTexture* tex) {
+	if (entry.size() > 4 && entry.compare(0, 4, "cbz:") == 0) {
+		size_t lastColon = entry.rfind(':');
+		if (lastColon != std::string::npos && lastColon > 4) {
+			std::string path = entry.substr(4, lastColon - 4);
+			int pageIndex = atoi(entry.substr(lastColon + 1).c_str());
+			loadCbzPageIntoTexture(path.c_str(), pageIndex, tex);
+			return;
+		}
+	}
+	tex->loadFromFile(entry);
+}
+
+void renderLoadingProgress() {
+	SDL_SetRenderDrawColor(gRenderer, 233, 234, 237, 0xFF);
+	SDL_RenderClear(gRenderer);
+	int barX = 140, barY = 340, barW = 1000, barH = 36;
+	SDL_Rect bg = { barX, barY, barW, barH };
+	SDL_SetRenderDrawColor(gRenderer, 200, 200, 200, 255);
+	SDL_RenderFillRect(gRenderer, &bg);
+	SDL_SetRenderDrawColor(gRenderer, 80, 140, 220, 255);
+	SDL_Rect fill = { barX + 2, barY + 2, (barW - 4) * g_loading_pct / 100, barH - 4 };
+	if (fill.w > 0) SDL_RenderFillRect(gRenderer, &fill);
+	char pctBuf[32];
+	snprintf(pctBuf, sizeof(pctBuf), "%d%%", g_loading_pct);
+	if (gFont) {
+		gTextTexture.loadFromRenderedText(gFont, g_loading_msg.empty() ? "Loading..." : g_loading_msg.c_str(), { 50, 50, 50 });
+		gTextTexture.render(g_view_w / 2 - gTextTexture.getWidth() / 2, barY - 30);
+		gTextTexture.loadFromRenderedText(gFont, pctBuf, { 0, 0, 0 });
+		gTextTexture.render(g_view_w / 2 - gTextTexture.getWidth() / 2, barY + barH + 8);
+	}
+	SDL_RenderPresent(gRenderer);
+	SDL_PumpEvents();
+}
 
 void close()
 {
@@ -443,11 +658,21 @@ void close()
 	gFont2 = NULL;
 	TTF_CloseFont(gFont3);
 	gFont3 = NULL;
+	//Destroy portrait render target
+	if (g_portrait_texture != NULL)
+	{
+		SDL_DestroyTexture(g_portrait_texture);
+		g_portrait_texture = NULL;
+	}
 	//Destroy window	
 	SDL_DestroyRenderer(gRenderer);
 	SDL_DestroyWindow(gWindow);
 	gWindow = NULL;
 	gRenderer = NULL;
+
+	// MuPDF cleanup
+	if (g_mupdf_doc && g_mupdf_ctx) { fz_drop_document(g_mupdf_ctx, g_mupdf_doc); g_mupdf_doc = NULL; }
+	if (g_mupdf_ctx) { fz_drop_context(g_mupdf_ctx); g_mupdf_ctx = NULL; }
 
 	//Quit SDL subsystems
 	TTF_Quit();
@@ -590,6 +815,7 @@ void downloadfile(std::string enlace, std::string directorydown)
 
 
 std::vector<std::string> arraymain;
+std::vector<bool> arraymain_is_dir;  // true = folder, false = .cbz file
 std::vector<std::string> arraychapter;
 
 
@@ -602,6 +828,8 @@ int main(int argc, char **argv)
 	romfsInit();
 	socketInitializeDefault();
 	nxlinkStdio();
+	// Mount SD card so sdmc:/ paths work (required for CuteManga folder)
+	fsdevMountSdmc();
 
 #endif 
 	int basex = 0;
@@ -667,6 +895,10 @@ int main(int argc, char **argv)
 					printf("SDL_ttf could not initialize! SDL_ttf Error: %s\n", TTF_GetError());
 
 				}
+
+				// MuPDF context for CBZ
+				g_mupdf_ctx = fz_new_context(NULL, NULL, FZ_STORE_UNLIMITED);
+				if (g_mupdf_ctx) fz_register_document_handlers(g_mupdf_ctx);
 			}
 		}
 	}
@@ -701,33 +933,51 @@ int main(int argc, char **argv)
 	
 #endif // SWITCH
 
-	
+#ifdef __SWITCH__
+	// Create CuteManga folder on SD if it doesn't exist
+	{
+		struct stat st = { 0 };
+		if (stat(foldermain.c_str(), &st) == -1)
+			mkdir(foldermain.c_str(), 0755);
+	}
+#endif
 
 	arraymain.clear();
+	arraymain_is_dir.clear();
 	DIR *dirmain;
 	struct dirent *entmain;
 	if ((dirmain = opendir(foldermain.c_str())) != NULL) {
-		/* print all the files and directories within directory */
+		std::vector<std::pair<std::string, bool> > entries;
 		while ((entmain = readdir(dirmain)) != NULL) {
 			if (strcmp(entmain->d_name, ".") == 0 || strcmp(entmain->d_name, "..") == 0)
 				continue;
-			if (entmain->d_type == DT_DIR)
-			{
+			std::string name(entmain->d_name);
+			bool is_dir = (entmain->d_type == DT_DIR);
+			if (entmain->d_type == DT_UNKNOWN) {
+				std::string fullpath = foldermain + name;
+				struct stat st;
+				if (stat(fullpath.c_str(), &st) == 0)
+					is_dir = S_ISDIR(st.st_mode);
+			}
+			// List folders and .cbz archives only (CBR not supported)
+			bool is_archive = (name.size() >= 4 && name.compare(name.size() - 4, 4, ".cbz") == 0);
+			if (is_dir || is_archive) {
 				printf("%s\n", entmain->d_name);
-
-				std::string namefile(entmain->d_name);
-
-				arraymain.push_back(namefile);
+				entries.push_back(std::make_pair(name, is_dir));
 			}
 		}
-		std::sort(arraymain.begin(),arraymain.end()); //Use the start and end like this
 		closedir(dirmain);
+		std::sort(entries.begin(), entries.end(),
+			[](const std::pair<std::string, bool>& a, const std::pair<std::string, bool>& b) {
+				return naturalSortCompare(a.first, b.first);
+			});
+		for (size_t i = 0; i < entries.size(); i++) {
+			arraymain.push_back(entries[i].first);
+			arraymain_is_dir.push_back(entries[i].second);
+		}
 	}
 	else {
 		existfoldermain = false;
-		/* could not open directory */
-		//perror("");
-		//return EXIT_FAILURE;
 	}
 	
 
@@ -795,6 +1045,15 @@ int main(int argc, char **argv)
 			quit = 1;
 			
 		}
+		// Y: toggle portrait / landscape
+		if (kDown & HidNpadButton_Y)
+		{
+			g_portrait_mode = !g_portrait_mode;
+			g_view_w = g_portrait_mode ? 720 : 1280;
+			g_view_h = g_portrait_mode ? 1280 : 720;
+			if (g_portrait_mode && g_portrait_texture == NULL && gRenderer != NULL)
+				g_portrait_texture = SDL_CreateTexture(gRenderer, SDL_PIXELFORMAT_RGBA8888, SDL_TEXTUREACCESS_TARGET, 720, 1280);
+		}
 		if (kHeld & HidNpadButton_StickLDown)
 		{
 			switch (statenow)
@@ -803,12 +1062,12 @@ int main(int argc, char **argv)
 
 				if (cascade == false) {
 
-					if ((basey) > (SCREEN_HEIGHT - heightnew))
+					if ((basey) > (g_view_h - heightnew))
 					{
 						basey -= speed;
-						if (basey <= SCREEN_HEIGHT - heightnew)
+						if (basey <= g_view_h - heightnew)
 						{
-							basey = SCREEN_HEIGHT - heightnew;
+							basey = g_view_h - heightnew;
 						}
 					}
 				}
@@ -969,14 +1228,14 @@ int main(int argc, char **argv)
 					{
 						Pagemanga.free();
 						selectpage--;
-						Pagemanga.loadFromFile(arraychapter[selectpage]);
+						loadPageIntoTexture(arraychapter[selectpage], &Pagemanga);
 
 					}
 					else
 					{
 						Pagemanga.free();
 						selectpage = 0;
-						Pagemanga.loadFromFile(arraychapter[selectpage]);
+						loadPageIntoTexture(arraychapter[selectpage], &Pagemanga);
 					}
 				}
 				else
@@ -1004,7 +1263,7 @@ int main(int argc, char **argv)
 					{
 						Pagemanga.free();
 						selectpage++;
-						Pagemanga.loadFromFile(arraychapter[selectpage]);
+						loadPageIntoTexture(arraychapter[selectpage], &Pagemanga);
 
 					}
 				}
@@ -1071,6 +1330,66 @@ int main(int argc, char **argv)
 					}
 					break;
 				case selectmanga:
+					if (selectchapter < (int)arraymain_is_dir.size() && !arraymain_is_dir[selectchapter]) {
+						// Archive selected: try CBZ (ZIP); show progress bar
+						std::string fname = arraymain[selectchapter];
+						size_t start = fname.find_first_not_of(" \t\r\n");
+						size_t end = fname.find_last_not_of(" \t\r\n");
+						if (start != std::string::npos) fname = (end != std::string::npos) ? fname.substr(start, end - start + 1) : fname.substr(start);
+						std::string archPath = foldermain + fname;
+						for (size_t i = 0; i < archPath.size(); i++)
+							if (archPath[i] == '\\') archPath[i] = '/';
+						g_loading_pct = 0;
+						g_loading_msg = "Opening CBZ...";
+						renderLoadingProgress();
+						int pageCount = listPagesFromCbz(archPath.c_str(), cbzProgressUpdate);
+						if (pageCount <= 0) {
+							if (g_cbz_open_error == CBZ_ERR_FILE_NOT_FOUND)
+								g_loading_msg = "File not found. Put CBZ in sdmc:/CuteManga/";
+							else if (g_cbz_open_error == CBZ_ERR_NOT_ZIP) {
+								if (g_cbz_mupdf_error.empty())
+									g_loading_msg = "Not a valid CBZ file.";
+								else if (g_cbz_mupdf_error.find("cannot recognize archive") != std::string::npos)
+									g_loading_msg = "Not a ZIP. Use ZIP-based CBZ (not RAR/CBR).";
+								else
+									g_loading_msg = "CBZ: " + g_cbz_mupdf_error;
+							}
+							else
+								g_loading_msg = "No pages in CBZ.";
+							g_loading_pct = 0;
+							for (int wait = 0; wait < 60; wait++) {
+								renderLoadingProgress();
+								SDL_Delay(50);
+							}
+						} else {
+							g_loading_pct = 40;
+							g_loading_msg = "Loading first page...";
+							renderLoadingProgress();
+							arraychapter.clear();
+							for (int i = 0; i < pageCount; i++)
+								arraychapter.push_back(std::string("cbz:") + archPath + ":" + std::to_string(i));
+							selectpage = 0;
+							bool ok = loadCbzPageIntoTexture(archPath.c_str(), 0, &Pagemanga);
+							arraypage.resize(arraychapter.size());
+							if (cascadeactivated) {
+								for (int x = 0; x < pageCount; x++) {
+									g_loading_pct = 50 + (int)(50 * (x + 1) / pageCount);
+									g_loading_msg = "Loading pages...";
+									renderLoadingProgress();
+									loadCbzPageIntoTexture(archPath.c_str(), x, &arraypage[x]);
+								}
+							}
+							g_loading_pct = 100;
+							g_loading_msg = "Done";
+							renderLoadingProgress();
+							if (ok) {
+								statenow = readmanga;
+								helppage = true;
+							}
+						}
+						break;
+					}
+					{
 					std::string foldertoread = foldermain + arraymain[selectchapter] + "/";
 					arraychapter.clear();
 					DIR *dir;
@@ -1083,35 +1402,28 @@ int main(int argc, char **argv)
 							printf("%s\n", ent->d_name);
 
 							std::string namefile(ent->d_name);
-							if (namefile.find(".jpg") != -1 || namefile.find(".jpeg") != -1 || namefile.find(".png") != -1 || namefile.find(".bmp") != -1 || namefile.find(".gif") != -1 || namefile.find(".webp") != -1)
+							if (namefile.find(".jpg") != std::string::npos || namefile.find(".jpeg") != std::string::npos || namefile.find(".png") != std::string::npos || namefile.find(".bmp") != std::string::npos || namefile.find(".gif") != std::string::npos || namefile.find(".webp") != std::string::npos)
 								arraychapter.push_back(foldertoread + namefile);
 						}
-						
 
-						std::sort(arraychapter.begin(),arraychapter.end()); //Use the start and end like this
+						std::sort(arraychapter.begin(), arraychapter.end(), naturalSortCompare);
 						closedir(dir);
 					}
-					else {
 
-					}
+					if (arraychapter.size() > 0) {
+						loadPageIntoTexture(arraychapter[selectpage], &Pagemanga);
+						arraypage.resize(arraychapter.size());
 
-
-
-
-					Pagemanga.loadFromFile(arraychapter[selectpage]);
-					arraypage.resize(arraychapter.size());
-
-					if (cascadeactivated == true)
-					{
-						for (int x = 0; x < arraychapter.size(); x++)
+						if (cascadeactivated == true)
 						{
-							arraypage[x].loadFromFile(arraychapter[x]);
+							for (int x = 0; x < (int)arraychapter.size(); x++)
+								loadPageIntoTexture(arraychapter[x], &arraypage[x]);
 						}
+						std::cout << arraypage.size() << std::endl;
+						statenow = readmanga;
+						helppage = true;
 					}
-					std::cout << arraypage.size() << std::endl;
-					statenow = readmanga;
-					helppage = true;
-
+					}
 					break;
 				}
 			}
@@ -1183,6 +1495,8 @@ int main(int argc, char **argv)
 			{
 			case readmanga:
 				statenow = selectmanga;
+				if (g_mupdf_doc && g_mupdf_ctx) { fz_drop_document(g_mupdf_ctx, g_mupdf_doc); g_mupdf_doc = NULL; }
+				g_mupdf_path.clear();
 				Pagemanga.free();
 
 				for (int x = 0; x < arraypage.size(); x++)
@@ -1229,12 +1543,12 @@ int main(int argc, char **argv)
 						
 						if (cascade == false) {
 
-							if ((basey) > (SCREEN_HEIGHT - heightnew))
+							if ((basey) > (g_view_h - heightnew))
 							{
 								basey -= speed;
-								if (basey <= SCREEN_HEIGHT - heightnew)
+								if (basey <= g_view_h - heightnew)
 								{
-									basey = SCREEN_HEIGHT - heightnew;
+									basey = g_view_h - heightnew;
 								}
 							}
 						}
@@ -1320,41 +1634,94 @@ int main(int argc, char **argv)
 							}
 							break;
 						case selectmanga:
+							if (selectchapter < (int)arraymain_is_dir.size() && !arraymain_is_dir[selectchapter]) {
+								std::string fname = arraymain[selectchapter];
+								size_t start = fname.find_first_not_of(" \t\r\n");
+								size_t end = fname.find_last_not_of(" \t\r\n");
+								if (start != std::string::npos) fname = (end != std::string::npos) ? fname.substr(start, end - start + 1) : fname.substr(start);
+								std::string archPath = foldermain + fname;
+								for (size_t i = 0; i < archPath.size(); i++)
+									if (archPath[i] == '\\') archPath[i] = '/';
+								g_loading_pct = 0;
+								g_loading_msg = "Opening CBZ...";
+								renderLoadingProgress();
+								int pageCount = listPagesFromCbz(archPath.c_str(), cbzProgressUpdate);
+								if (pageCount <= 0) {
+									if (g_cbz_open_error == CBZ_ERR_FILE_NOT_FOUND)
+										g_loading_msg = "File not found. Put CBZ in sdmc:/CuteManga/";
+									else if (g_cbz_open_error == CBZ_ERR_NOT_ZIP) {
+										if (g_cbz_mupdf_error.empty())
+											g_loading_msg = "Not a valid CBZ file.";
+										else if (g_cbz_mupdf_error.find("cannot recognize archive") != std::string::npos)
+											g_loading_msg = "Not a ZIP. Use ZIP-based CBZ (not RAR/CBR).";
+										else
+											g_loading_msg = "CBZ: " + g_cbz_mupdf_error;
+									}
+									else
+										g_loading_msg = "No pages in CBZ.";
+									g_loading_pct = 0;
+									for (int wait = 0; wait < 60; wait++) {
+										renderLoadingProgress();
+										SDL_Delay(50);
+									}
+								} else {
+									g_loading_pct = 40;
+									g_loading_msg = "Loading first page...";
+									renderLoadingProgress();
+									arraychapter.clear();
+									for (int i = 0; i < pageCount; i++)
+										arraychapter.push_back(std::string("cbz:") + archPath + ":" + std::to_string(i));
+									selectpage = 0;
+									bool ok = loadCbzPageIntoTexture(archPath.c_str(), 0, &Pagemanga);
+									arraypage.resize(arraychapter.size());
+									if (cascadeactivated) {
+										for (int x = 0; x < pageCount; x++) {
+											g_loading_pct = 50 + (int)(50 * (x + 1) / pageCount);
+											g_loading_msg = "Loading pages...";
+											renderLoadingProgress();
+											loadCbzPageIntoTexture(archPath.c_str(), x, &arraypage[x]);
+										}
+									}
+									g_loading_pct = 100;
+									g_loading_msg = "Done";
+									renderLoadingProgress();
+									if (ok) {
+										statenow = readmanga;
+										helppage = true;
+									}
+								}
+								break;
+							}
+							{
 							std::string foldertoread = foldermain + arraymain[selectchapter] + "/";
 							arraychapter.clear();
 							DIR *dir;
 							struct dirent *ent;
 							if ((dir = opendir(foldertoread.c_str())) != NULL) {
-
 								while ((ent = readdir(dir)) != NULL) {
 									if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
 										continue;
 									printf("%s\n", ent->d_name);
-
 									std::string namefile(ent->d_name);
-									if (namefile.find(".jpg") != -1 || namefile.find(".jpeg") != -1 || namefile.find(".png") != -1 || namefile.find(".bmp") != -1 || namefile.find(".gif") != -1 || namefile.find(".webp") != -1)
+									if (namefile.find(".jpg") != std::string::npos || namefile.find(".jpeg") != std::string::npos || namefile.find(".png") != std::string::npos || namefile.find(".bmp") != std::string::npos || namefile.find(".gif") != std::string::npos || namefile.find(".webp") != std::string::npos)
 										arraychapter.push_back(foldertoread + namefile);
 								}
+								std::sort(arraychapter.begin(), arraychapter.end(), naturalSortCompare);
 								closedir(dir);
 							}
-							else {
 
+							if (arraychapter.size() > 0) {
+								loadPageIntoTexture(arraychapter[selectpage], &Pagemanga);
+								arraypage.resize(arraychapter.size());
+								if (cascadeactivated == true) {
+									for (int x = 0; x < (int)arraychapter.size(); x++)
+										loadPageIntoTexture(arraychapter[x], &arraypage[x]);
+								}
+								std::cout << arraypage.size() << std::endl;
+								statenow = readmanga;
+								helppage = true;
 							}
-
-
-
-
-							Pagemanga.loadFromFile(arraychapter[selectpage]);
-							arraypage.resize(arraychapter.size());
-
-							if (cascadeactivated == true)
-							{for (int x = 0; x < arraychapter.size(); x++)
-							{
-								arraypage[x].loadFromFile(arraychapter[x]);
-							}}
-							std::cout << arraypage.size() << std::endl;
-							statenow = readmanga;
-							helppage = true;
+							}
 							break;
 						}
 					}
@@ -1376,10 +1743,19 @@ int main(int argc, char **argv)
 					}
 
 					break;
+				case SDLK_y:
+					g_portrait_mode = !g_portrait_mode;
+					g_view_w = g_portrait_mode ? 720 : 1280;
+					g_view_h = g_portrait_mode ? 1280 : 720;
+					if (g_portrait_mode && g_portrait_texture == NULL && gRenderer != NULL)
+						g_portrait_texture = SDL_CreateTexture(gRenderer, SDL_PIXELFORMAT_RGBA8888, SDL_TEXTUREACCESS_TARGET, 720, 1280);
+					break;
 				case SDLK_b:
 					switch (statenow)
 					{case readmanga:
 						statenow = selectmanga;
+						if (g_mupdf_doc && g_mupdf_ctx) { fz_drop_document(g_mupdf_ctx, g_mupdf_doc); g_mupdf_doc = NULL; }
+						g_mupdf_path.clear();
 						Pagemanga.free();
 
 						for (int x = 0; x < arraypage.size(); x++)
@@ -1418,14 +1794,14 @@ int main(int argc, char **argv)
 							{
 								Pagemanga.free();
 								selectpage--;
-								Pagemanga.loadFromFile(arraychapter[selectpage]);
+								loadPageIntoTexture(arraychapter[selectpage], &Pagemanga);
 
 							}
 							else
 							{
 								Pagemanga.free();
 								selectpage = 0;
-								Pagemanga.loadFromFile(arraychapter[selectpage]);
+								loadPageIntoTexture(arraychapter[selectpage], &Pagemanga);
 							}
 						}
 						else
@@ -1452,7 +1828,7 @@ int main(int argc, char **argv)
 							{
 								Pagemanga.free();
 								selectpage++;
-								Pagemanga.loadFromFile(arraychapter[selectpage]);
+								loadPageIntoTexture(arraychapter[selectpage], &Pagemanga);
 
 							}
 						}
@@ -1617,7 +1993,9 @@ int main(int argc, char **argv)
 
 
 
-		//Clear screen
+		//Clear screen (or portrait render target when in portrait mode)
+		if (g_portrait_mode && g_portrait_texture != NULL)
+			SDL_SetRenderTarget(gRenderer, g_portrait_texture);
 		SDL_SetRenderDrawColor(gRenderer, 233, 234, 237, 0xFF);
 		SDL_RenderClear(gRenderer);
 
@@ -1640,23 +2018,23 @@ int main(int argc, char **argv)
 
 					if (adjust == true)
 					{
-						widthnew = SCREEN_WIDTH * zoom;
-						heightnew = ((arraypage[x].getHeight() * SCREEN_WIDTH) / arraypage[x].getWidth()) * zoom;
-						arraypage[x].customrender((SCREEN_WIDTH / 2 - widthnew / 2) + basex, ycascade + basey, widthnew, heightnew);
+						widthnew = g_view_w * zoom;
+						heightnew = ((arraypage[x].getHeight() * g_view_w) / arraypage[x].getWidth()) * zoom;
+						arraypage[x].customrender((g_view_w / 2 - widthnew / 2) + basex, ycascade + basey, widthnew, heightnew);
 					}
 					else
 					{
 						widthnew = arraypage[x].getWidth()*zoom*neutralsize;
 						heightnew = arraypage[x].getHeight()*zoom*neutralsize;
-						if (widthnew >= SCREEN_WIDTH)
+						if (widthnew >= g_view_w)
 						{
 
-							widthnew = SCREEN_WIDTH*zoom;
-							heightnew = ((arraypage[x].getHeight() * SCREEN_WIDTH) / arraypage[x].getWidth())*zoom;
+							widthnew = g_view_w*zoom;
+							heightnew = ((arraypage[x].getHeight() * g_view_w) / arraypage[x].getWidth())*zoom;
 
 						}
 
-						arraypage[x].customrender((SCREEN_WIDTH / 2 - widthnew / 2) + basex, ycascade + basey, widthnew, heightnew);
+						arraypage[x].customrender((g_view_w / 2 - widthnew / 2) + basex, ycascade + basey, widthnew, heightnew);
 					}
 					if (separation == false)
 					{
@@ -1683,58 +2061,72 @@ int main(int argc, char **argv)
 			{
 				if (adjust == true)
 				{
-					widthnew = SCREEN_WIDTH * zoom;
-					heightnew = ((Pagemanga.getHeight() * SCREEN_WIDTH) / Pagemanga.getWidth()) * zoom;
-					Pagemanga.customrender((SCREEN_WIDTH / 2 - widthnew / 2) + basex, 0 + basey, widthnew, heightnew);
+					widthnew = g_view_w * zoom;
+					heightnew = ((Pagemanga.getHeight() * g_view_w) / Pagemanga.getWidth()) * zoom;
+					Pagemanga.customrender((g_view_w / 2 - widthnew / 2) + basex, 0 + basey, widthnew, heightnew);
 				}
 				else
 				{
 					
 					widthnew = Pagemanga.getWidth()*zoom * neutralsize;
 					heightnew = Pagemanga.getHeight()*zoom * neutralsize;
-					if (widthnew >= SCREEN_WIDTH)
+					if (widthnew >= g_view_w)
 					{
 						
-						widthnew = SCREEN_WIDTH*zoom;
-						heightnew = ((Pagemanga.getHeight() * SCREEN_WIDTH) / Pagemanga.getWidth())*zoom;
+						widthnew = g_view_w*zoom;
+						heightnew = ((Pagemanga.getHeight() * g_view_w) / Pagemanga.getWidth())*zoom;
 						
 					}
-					Pagemanga.customrender((SCREEN_WIDTH / 2 - widthnew / 2) + basex, 0 + basey, widthnew, heightnew);
+					Pagemanga.customrender((g_view_w / 2 - widthnew / 2) + basex, 0 + basey, widthnew, heightnew);
 
 				}
 			}
 
 
 			if (zoom == 2) {
-				lupa.render(SCREEN_WIDTH - lupa.getWidth() - 10, SCREEN_HEIGHT - lupa.getHeight() - 10);
+				lupa.render(g_view_w - lupa.getWidth() - 10, g_view_h - lupa.getHeight() - 10);
 			}
 
 			if (helppage == true)
 			{
-				SDL_Rect fillRect2 = { SCREEN_WIDTH / 2 + 110, SCREEN_HEIGHT / 2 +130  , 502, 202 };
-				SDL_SetRenderDrawColor(gRenderer, 0, 0, 0, 0);
+				// Help box fits view (portrait 720 wide); centered
+				int helpW = (g_view_w > 540) ? 500 : (g_view_w - 40);
+				int helpH = 220;
+				int helpX = (g_view_w - helpW) / 2;
+				int helpY = (g_view_h - helpH) / 2;
+				SDL_Rect fillRect2 = { helpX - 2, helpY - 2, helpW + 4, helpH + 4 };
+				SDL_SetRenderDrawColor(gRenderer, 0, 0, 0, 200);
 				SDL_RenderFillRect(gRenderer, &fillRect2);
-				SDL_Rect fillRect = { SCREEN_WIDTH / 2 +100, SCREEN_HEIGHT / 2 +120  , 500, 200 };
+				SDL_Rect fillRect = { helpX, helpY, helpW, helpH };
 				SDL_SetRenderDrawColor(gRenderer, 255, 255, 255, 255);
 				SDL_RenderFillRect(gRenderer, &fillRect);
+				int tx = helpX + (helpW / 2);
+				int ty = helpY + 20;
 				if (cascadeactivated == true)
 				{
 					gTextTexture.loadFromRenderedText(gFont, "Press \"X\" for Cascade Mode (Separation or not).", { 0, 0, 0 });
-					gTextTexture.render(SCREEN_WIDTH / 2 - gTextTexture.getWidth() / 2 + 350, (SCREEN_HEIGHT / 2 - gTextTexture.getHeight() / 2) + 150);
+					gTextTexture.render(tx - gTextTexture.getWidth() / 2, ty);
 				}
 				else
 				{
 					gTextTexture.loadFromRenderedText(gFont, "Cascade is disabled, enable it in the Main Menu.", { 0, 0, 0 });
-					gTextTexture.render(SCREEN_WIDTH / 2 - gTextTexture.getWidth() / 2 + 350, (SCREEN_HEIGHT / 2 - gTextTexture.getHeight() / 2) + 150);
+					gTextTexture.render(tx - gTextTexture.getWidth() / 2, ty);
 				}
+				ty += 28;
 				gTextTexture.loadFromRenderedText(gFont, "Press \"A\" for Fit Mode (On/Off).", { 0, 0, 0 });
-				gTextTexture.render(SCREEN_WIDTH / 2 - gTextTexture.getWidth() / 2 + 350, 30 + (SCREEN_HEIGHT / 2 - gTextTexture.getHeight() / 2) +150);
+				gTextTexture.render(tx - gTextTexture.getWidth() / 2, ty);
+				ty += 28;
 				gTextTexture.loadFromRenderedText(gFont, "Press \"L\" for Previous page and \"R\" for Next page.", { 0, 0, 0 });
-				gTextTexture.render(SCREEN_WIDTH / 2 - gTextTexture.getWidth() / 2 + 350, 60 + (SCREEN_HEIGHT / 2 - gTextTexture.getHeight() / 2) +150);
+				gTextTexture.render(tx - gTextTexture.getWidth() / 2, ty);
+				ty += 28;
 				gTextTexture.loadFromRenderedText(gFont, "Press \"ZL, ZR and R3\" for Zoom Mode.", { 0, 0, 0 });
-				gTextTexture.render(SCREEN_WIDTH / 2 - gTextTexture.getWidth() / 2 + 350, 90 + (SCREEN_HEIGHT / 2 - gTextTexture.getHeight() / 2) +150);
+				gTextTexture.render(tx - gTextTexture.getWidth() / 2, ty);
+				ty += 28;
 				gTextTexture.loadFromRenderedText(gFont, "Press \"L3\" for show/hide this.", { 0, 0, 0 });
-				gTextTexture.render(SCREEN_WIDTH / 2 - gTextTexture.getWidth() / 2 + 350, 120 + (SCREEN_HEIGHT / 2 - gTextTexture.getHeight() / 2) +150);
+				gTextTexture.render(tx - gTextTexture.getWidth() / 2, ty);
+				ty += 28;
+				gTextTexture.loadFromRenderedText(gFont, "Press \"Y\" for Portrait/Landscape.", { 0, 0, 0 });
+				gTextTexture.render(tx - gTextTexture.getWidth() / 2, ty);
 			}
 		
 		break;
@@ -1748,12 +2140,12 @@ int main(int argc, char **argv)
 			if (existfoldermain == false)
 			{
 				gTextTexture.loadFromRenderedText(gFont3, "Please create the folder called \"CuteManga\" in", { 0, 0, 0 });
-				gTextTexture.render(SCREEN_WIDTH / 2 - gTextTexture.getWidth() / 2, 100);
+				gTextTexture.render(g_view_w / 2 - gTextTexture.getWidth() / 2, 100);
 				gTextTexture.loadFromRenderedText(gFont3, "your SD and put your \"Comic / Manga / Webtoon\" inside", { 0, 0, 0 });
-				gTextTexture.render(SCREEN_WIDTH / 2 - gTextTexture.getWidth() / 2, 130);
+				gTextTexture.render(g_view_w / 2 - gTextTexture.getWidth() / 2, 130);
 				
 					gTextTexture.loadFromRenderedText(gFont3, "in a folder without Latin characters.", { 0, 0, 0 });
-				gTextTexture.render(SCREEN_WIDTH / 2 - gTextTexture.getWidth() / 2, 160);
+				gTextTexture.render(g_view_w / 2 - gTextTexture.getWidth() / 2, 160);
 				
 			}
 		
@@ -1786,21 +2178,32 @@ int main(int argc, char **argv)
 				}
 
 			}
-			{SDL_Rect fillRect = { 0, SCREEN_HEIGHT - 35, 1280, 25 };
+			{SDL_Rect fillRect = { 0, g_view_h - 35, 1280, 25 };
 			SDL_SetRenderDrawColor(gRenderer, 255, 255, 255, 255);
 
 			SDL_RenderFillRect(gRenderer, &fillRect); }
 
 			textColor = { 50, 50, 50 };
-			if (cascadeactivated == false)
+			bool sel_is_archive = (selectchapter < (int)arraymain_is_dir.size() && !arraymain_is_dir[selectchapter]);
+			if (sel_is_archive)
+			{
+				std::string name = (selectchapter < (int)arraymain.size()) ? arraymain[selectchapter] : "";
+				bool is_cbz = (name.size() >= 4 && name.compare(name.size() - 4, 4, ".cbz") == 0);
+				if (is_cbz)
+					gTextTexture.loadFromRenderedText(gFont, "CBZ selected - press \"A\" to read. ", textColor);
+				else
+					gTextTexture.loadFromRenderedText(gFont, "Folder - press \"A\" to open. ", textColor);
+				gTextTexture.render(basexmain, g_view_h - 30);
+			}
+			else if (cascadeactivated == false)
 			{
 				gTextTexture.loadFromRenderedText(gFont, "\"A\" to read folder - \"X\" for Enable Cascade Mode (Load slow and High Memory use). ", textColor);
-				gTextTexture.render(basexmain, SCREEN_HEIGHT - 30);
+				gTextTexture.render(basexmain, g_view_h - 30);
 			}
 			else
 			{
 				gTextTexture.loadFromRenderedText(gFont, "\"A\" to read folder - \"X\" for Disable Cascade Mode (Instant load and Low Memory use). ", textColor);
-				gTextTexture.render(basexmain, SCREEN_HEIGHT - 30);
+				gTextTexture.render(basexmain, g_view_h - 30);
 			}
 
 
@@ -1814,7 +2217,17 @@ int main(int argc, char **argv)
 
 
 
-		//Update screen
+		//Update screen (if portrait, draw rotated view onto main target)
+		if (g_portrait_mode && g_portrait_texture != NULL)
+		{
+			SDL_SetRenderTarget(gRenderer, NULL);
+			SDL_SetRenderDrawColor(gRenderer, 0, 0, 0, 255);
+			SDL_RenderClear(gRenderer);
+			// Texture is 720x1280; SDL scales to dest then rotates. Use dest 720x1280 so after -90° we get 1280x720 and fill screen. Center the rect so rotated result is centered.
+			SDL_Rect dest = { (1280 - 720) / 2, (720 - 1280) / 2, 720, 1280 };
+			SDL_Point center = { 360, 640 };
+			SDL_RenderCopyEx(gRenderer, g_portrait_texture, NULL, &dest, -90.0, &center, SDL_FLIP_NONE);
+		}
 		SDL_RenderPresent(gRenderer);
 
 
