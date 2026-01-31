@@ -117,7 +117,8 @@ main.o: C:/Users/marila/Documents/Projetos/CuteManga/source/main.cpp \
  C:/Users/marila/Documents/Projetos/CuteManga/libs/mupdf/include/mupdf/fitz/story.h \
  C:/Users/marila/Documents/Projetos/CuteManga/libs/mupdf/include/mupdf/fitz/story-writer.h \
  C:/Users/marila/Documents/Projetos/CuteManga/libs/mupdf/include/mupdf/fitz/deskew.h \
- C:/Users/marila/Documents/Projetos/CuteManga/libs/mupdf/include/mupdf/fitz/barcode.h
+ C:/Users/marila/Documents/Projetos/CuteManga/libs/mupdf/include/mupdf/fitz/barcode.h \
+ C:/Users/marila/Documents/Projetos/CuteManga/include/cute_manga.h
 C:/devkitPro/portlibs/switch/include/SDL2/SDL.h:
 C:/devkitPro/portlibs/switch/include/SDL2/SDL_main.h:
 C:/devkitPro/portlibs/switch/include/SDL2/SDL_stdinc.h:
@@ -237,3 +238,4 @@ C:/Users/marila/Documents/Projetos/CuteManga/libs/mupdf/include/mupdf/fitz/story
 C:/Users/marila/Documents/Projetos/CuteManga/libs/mupdf/include/mupdf/fitz/story-writer.h:
 C:/Users/marila/Documents/Projetos/CuteManga/libs/mupdf/include/mupdf/fitz/deskew.h:
 C:/Users/marila/Documents/Projetos/CuteManga/libs/mupdf/include/mupdf/fitz/barcode.h:
+C:/Users/marila/Documents/Projetos/CuteManga/include/cute_manga.h:
