@@ -2,7 +2,7 @@
 
 A manga and comic reader for **Nintendo Switch** (homebrew). Read CBZ comics and image-based manga from your SD card in landscape or portrait, with zoom, fit mode, and cascade viewing.
 
-**Version:** 1.0.5 (see [Releases](https://github.com/pinheiroam/CuteManga/releases) for builds)
+**Version:** 1.0.6 (see [Releases](https://github.com/pinheiroam/CuteManga/releases) for builds)
 
 ---
 
@@ -62,19 +62,6 @@ In the main menu, **X** enables or disables Cascade Mode for the next time you o
 - **CuteManga** — Original app by **AngelXex**.
 - **MuPDF** — Used for CBZ (ZIP) comic rendering ([Artifex MuPDF](https://mupdf.com/)).
 - Nintendo Switch build uses **libnx** and **SDL2** via devkitPro.
-
----
-
-## Version & releases
-
-- **Version** is set in the project **Makefile** (`VERSION_MAJOR`, `VERSION_MINOR`, `VERSION_MICRO`). The same value is used in the built `.nro` (NACP).
-- **Releases** — To publish a release:
-  1. Bump the version in the Makefile if needed.
-  2. Build: `make` → `out/CuteManga.nro`.
-  3. Create a **git tag** (e.g. `v1.0.5`):  
-     `git tag -a v1.0.5 -m "Release 1.0.5"`  
-     `git push origin v1.0.5`
-  4. On GitHub: **Releases** → **Draft a new release** → choose the tag, add release notes, and attach `out/CuteManga.nro` (or a zip with the `.nro`).
 
 ---
 
