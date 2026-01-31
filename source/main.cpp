@@ -147,6 +147,10 @@ static const int LIST_TOP = 30;
 static const int LIST_FOOTER_HEIGHT = 35;
 static const int LIST_MAX_VISIBLE_LANDSCAPE = 30;
 static const int LIST_MAX_VISIBLE_PORTRAIT = 50;
+static const int LIST_HOLD_INITIAL_FRAMES = 15;   // frames before hold-repeat starts (~0.25s at 60fps)
+static const int LIST_HOLD_REPEAT_FRAMES = 3;     // move every N frames when holding (~20/s at 60fps)
+static int s_list_hold_down_frames = 0;
+static int s_list_hold_up_frames = 0;
 bool cascadeactivated = false;
 
 static size_t getMangaListCount();  // forward decl for clampListScroll
@@ -1358,6 +1362,44 @@ void handleSwitchInput(u64 kDown, u64 kHeld) {
 			break;
 		}
 	}
+	if (kHeld & (HidNpadButton_Down | HidNpadButton_StickLDown)) {
+		if (statenow == selectmanga) {
+			s_list_hold_down_frames++;
+			if (s_list_hold_down_frames > LIST_HOLD_INITIAL_FRAMES &&
+				(s_list_hold_down_frames - LIST_HOLD_INITIAL_FRAMES) % LIST_HOLD_REPEAT_FRAMES == 0) {
+				g_cbz_open_error_msg.clear();
+				if (selectchapter < (int)getMangaListCount() - 1) {
+					selectchapter++;
+					baseymain -= LIST_LINE_HEIGHT;
+				} else { selectchapter = 0; baseymain = LIST_TOP; }
+			}
+		}
+	} else {
+		s_list_hold_down_frames = 0;
+	}
+	if (kHeld & (HidNpadButton_Up | HidNpadButton_StickLUp)) {
+		if (statenow == selectmanga) {
+			s_list_hold_up_frames++;
+			if (s_list_hold_up_frames > LIST_HOLD_INITIAL_FRAMES &&
+				(s_list_hold_up_frames - LIST_HOLD_INITIAL_FRAMES) % LIST_HOLD_REPEAT_FRAMES == 0) {
+				g_cbz_open_error_msg.clear();
+				if (selectchapter > 0) {
+					selectchapter--;
+					baseymain += LIST_LINE_HEIGHT;
+				} else {
+					size_t n = getMangaListCount();
+					selectchapter = (n > 0) ? (int)n - 1 : 0;
+					if (n > 0) {
+						int max_vis = getListMaxVisible();
+						baseymain = LIST_TOP + LIST_LINE_HEIGHT * (max_vis - (int)n);
+						if (baseymain > LIST_TOP) baseymain = LIST_TOP;
+					}
+				}
+			}
+		}
+	} else {
+		s_list_hold_up_frames = 0;
+	}
 	if (kHeld & HidNpadButton_StickLLeft) {
 		switch (statenow) {
 		case readmanga:
@@ -1666,13 +1708,17 @@ void handlePCInput(SDL_Event& e) {
 					}
 				} else basey -= speed;
 				break;
-			case selectmanga:
+			case selectmanga: {
 				g_cbz_open_error_msg.clear();
-				if (selectchapter < (int)getMangaListCount() - 1) {
-					selectchapter++;
-					baseymain -= LIST_LINE_HEIGHT;
-				} else { selectchapter = 0; baseymain = LIST_TOP; }
+				int step = (e.key.repeat) ? 5 : 1;
+				for (int i = 0; i < step; i++) {
+					if (selectchapter < (int)getMangaListCount() - 1) {
+						selectchapter++;
+						baseymain -= LIST_LINE_HEIGHT;
+					} else { selectchapter = 0; baseymain = LIST_TOP; break; }
+				}
 				break;
+			}
 			}
 			break;
 		case SDLK_UP:
@@ -1684,19 +1730,26 @@ void handlePCInput(SDL_Event& e) {
 					if (basey <= 0) { basey += speed; if (basey > 0) basey = 0; }
 				}
 				break;
-			case selectmanga:
+			case selectmanga: {
 				g_cbz_open_error_msg.clear();
-				if (selectchapter > 0) { selectchapter--; baseymain += LIST_LINE_HEIGHT; }
-				else {
-					size_t n = getMangaListCount();
-					selectchapter = (n > 0) ? (int)n - 1 : 0;
-					if (n > 0) {
-						int max_vis = getListMaxVisible();
-						baseymain = LIST_TOP + LIST_LINE_HEIGHT * (max_vis - (int)n);
-						if (baseymain > LIST_TOP) baseymain = LIST_TOP;
+				int step = (e.key.repeat) ? 5 : 1;
+				for (int i = 0; i < step; i++) {
+					if (selectchapter > 0) {
+						selectchapter--;
+						baseymain += LIST_LINE_HEIGHT;
+					} else {
+						size_t n = getMangaListCount();
+						selectchapter = (n > 0) ? (int)n - 1 : 0;
+						if (n > 0) {
+							int max_vis = getListMaxVisible();
+							baseymain = LIST_TOP + LIST_LINE_HEIGHT * (max_vis - (int)n);
+							if (baseymain > LIST_TOP) baseymain = LIST_TOP;
+						}
+						break;
 					}
 				}
 				break;
+			}
 			}
 			break;
 		case SDLK_a:
