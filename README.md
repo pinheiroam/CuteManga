@@ -1,6 +1,6 @@
 # CuteManga
 
-A manga and comic reader for **Nintendo Switch** (homebrew). Read **CBZ** (ZIP), **CBR** (RAR), **PDF** comics and image-based manga from your SD card in landscape or portrait, with zoom, fit mode, and cascade viewing.
+A manga and comic reader for **Nintendo Switch** (homebrew). Read **CBZ** (ZIP), **CBR** (RAR), **PDF** comics and image-based manga from your SD card in landscape or portrait, with zoom and cascade viewing.
 
 **Version:** 1.0.6 (see [Releases](https://github.com/pinheiroam/CuteManga/releases) for builds)
 
@@ -13,8 +13,7 @@ A manga and comic reader for **Nintendo Switch** (homebrew). Read **CBZ** (ZIP),
 - **CBR support** (optional) — Read RAR-based comic archives (`.cbr`) when built with [unarr](https://github.com/selmf/unarr). Requires building unarr for Switch (see Build).
 - **Image folders** — Browse folders of images (PNG, JPG, etc.) as manga chapters.
 - **Portrait & landscape** — Toggle orientation anytime with the **Y** button for comfortable reading.
-- **Fit mode** — Scale pages to fit the screen width (toggle with **A**).
-- **Zoom** — 2× zoom for detail; pan with the left stick when zoomed (trigger with **ZL**, **ZR**, or **R3**).
+- **Zoom** — 2× zoom for detail; pan with the left stick when zoomed (trigger with **R3**).
 - **Cascade mode** — View multiple pages in a vertical strip (enable in the main menu with **X**; uses more memory).
 - **Natural sort** — Chapters and pages sorted in natural order (e.g. `page 2` before `page 10`).
 - **Keyboard** — On-Switch keyboard for search/input when needed.
@@ -40,8 +39,7 @@ A manga and comic reader for **Nintendo Switch** (homebrew). Read **CBZ** (ZIP),
 | **Portrait / Landscape** | **Y** |
 | **Previous page** | **L** |
 | **Next page** | **R** |
-| **Fit mode (on/off)** | **A** |
-| **Zoom (2×)** | **ZL** / **ZR** / **R3** |
+| **Zoom (2×)** | **R3** |
 | **Cascade mode (in reader)** | **X** |
 | **Back to list** | **B** |
 | **Show / hide shortcuts** | **Minus** or **L3** |

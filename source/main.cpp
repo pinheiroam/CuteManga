@@ -141,7 +141,26 @@ bool helppage = false;
 bool existfoldermain = true;
 int basexmain = 20;
 int baseymain = 20;
+// List: fixed row height; max items on screen; scroll when over limit (full list stays in memory for search)
+static const int LIST_LINE_HEIGHT = 18;
+static const int LIST_TOP = 30;
+static const int LIST_FOOTER_HEIGHT = 35;
+static const int LIST_MAX_VISIBLE_LANDSCAPE = 30;
+static const int LIST_MAX_VISIBLE_PORTRAIT = 50;
 bool cascadeactivated = false;
+
+static size_t getMangaListCount();  // forward decl for clampListScroll
+static int getListMaxVisible() { return g_portrait_mode ? LIST_MAX_VISIBLE_PORTRAIT : LIST_MAX_VISIBLE_LANDSCAPE; }
+static void clampListScroll() {
+	size_t n = getMangaListCount();
+	if (n == 0) return;
+	int max_vis = getListMaxVisible();
+	int baseymain_max = LIST_TOP;
+	int baseymain_min = LIST_TOP + LIST_LINE_HEIGHT * (max_vis - (int)n);
+	if (baseymain_min > baseymain_max) baseymain_min = baseymain_max;
+	if (baseymain < baseymain_min) baseymain = baseymain_min;
+	if (baseymain > baseymain_max) baseymain = baseymain_max;
+}
 // Main-loop state (used by handleInput / renderFrame)
 std::string g_foldermain;
 int basex = 0;
@@ -270,6 +289,8 @@ std::vector<std::string> arraymain_filtered;
 std::vector<bool> arraymain_is_dir_filtered;
 #ifndef __SWITCH__
 bool g_search_input_mode = false;
+bool g_goto_page_input_mode = false;
+std::string g_goto_page_input;
 #endif
 
 LTexture::LTexture()
@@ -974,10 +995,10 @@ static void rebuildSearchFilter() {
 		}
 	}
 	size_t n = arraymain_filtered.size();
-	if (n == 0) { selectchapter = 0; baseymain = 30; }
-	else if ((size_t)selectchapter >= n) {
-		selectchapter = (int)n - 1;
-		baseymain = 30 - 20 * ((int)n - 1);
+	if (n == 0) { selectchapter = 0; baseymain = LIST_TOP; }
+	else {
+		if ((size_t)selectchapter >= n) selectchapter = (int)n - 1;
+		baseymain = LIST_TOP;
 	}
 }
 
@@ -1038,6 +1059,7 @@ void loadFolderList(const std::string& foldermain) {
 			arraymain.push_back(entries[i].first);
 			arraymain_is_dir.push_back(entries[i].second);
 		}
+		baseymain = LIST_TOP;
 	} else {
 		existfoldermain = false;
 	}
@@ -1259,10 +1281,10 @@ void handleSwitchInput(u64 kDown, u64 kHeld) {
 			g_cbz_open_error_msg.clear();
 			if (selectchapter < (int)getMangaListCount() - 1) {
 				selectchapter++;
-				baseymain = baseymain - 20;
+				baseymain -= LIST_LINE_HEIGHT;
 			} else {
 				selectchapter = 0;
-				baseymain = 30;
+				baseymain = LIST_TOP;
 			}
 			break;
 		}
@@ -1290,11 +1312,48 @@ void handleSwitchInput(u64 kDown, u64 kHeld) {
 			g_cbz_open_error_msg.clear();
 			if (selectchapter > 0) {
 				selectchapter--;
-				baseymain = baseymain + 20;
+				baseymain += LIST_LINE_HEIGHT;
 			} else {
 				size_t n = getMangaListCount();
-				baseymain = (n > 0) ? (30 - 20 * ((int)n - 1)) : 30;
 				selectchapter = (n > 0) ? (int)n - 1 : 0;
+				if (n > 0) {
+					int max_vis = getListMaxVisible();
+					baseymain = LIST_TOP + LIST_LINE_HEIGHT * (max_vis - (int)n);
+					if (baseymain > LIST_TOP) baseymain = LIST_TOP;
+				}
+			}
+			break;
+		}
+	}
+	if (kDown & HidNpadButton_Up) {
+		switch (statenow) {
+		case selectmanga:
+			g_cbz_open_error_msg.clear();
+			if (selectchapter > 0) {
+				selectchapter--;
+				baseymain += LIST_LINE_HEIGHT;
+			} else {
+				size_t n = getMangaListCount();
+				selectchapter = (n > 0) ? (int)n - 1 : 0;
+				if (n > 0) {
+					int max_vis = getListMaxVisible();
+					baseymain = LIST_TOP + LIST_LINE_HEIGHT * (max_vis - (int)n);
+					if (baseymain > LIST_TOP) baseymain = LIST_TOP;
+				}
+			}
+			break;
+		}
+	}
+	if (kDown & HidNpadButton_Down) {
+		switch (statenow) {
+		case selectmanga:
+			g_cbz_open_error_msg.clear();
+			if (selectchapter < (int)getMangaListCount() - 1) {
+				selectchapter++;
+				baseymain -= LIST_LINE_HEIGHT;
+			} else {
+				selectchapter = 0;
+				baseymain = LIST_TOP;
 			}
 			break;
 		}
@@ -1310,20 +1369,6 @@ void handleSwitchInput(u64 kDown, u64 kHeld) {
 		switch (statenow) {
 		case readmanga:
 			if (zoom == 2) basex -= speed;
-			break;
-		}
-	}
-	if (kHeld & HidNpadButton_ZL) {
-		switch (statenow) {
-		case readmanga:
-			if (neutralsize > 0.05f) neutralsize -= 0.01f;
-			break;
-		}
-	}
-	if (kHeld & HidNpadButton_ZR) {
-		switch (statenow) {
-		case readmanga:
-			neutralsize += 0.01f;
 			break;
 		}
 	}
@@ -1367,10 +1412,23 @@ void handleSwitchInput(u64 kDown, u64 kHeld) {
 	if (kDown & HidNpadButton_A) {
 		if (existfoldermain) {
 			switch (statenow) {
-			case readmanga:
-				if (cascade == false) { basey = 0; adjust = !adjust; }
-				else adjust = !adjust;
+			case readmanga: {
+				int pageCount = (int)arraychapter.size();
+				if (pageCount <= 0) break;
+				char prompt[64];
+				snprintf(prompt, sizeof(prompt), "Go to page (1-%d):", pageCount);
+				std::string initial = std::to_string(selectpage + 1);
+				const char* result = Keyboard_GetTextSearch(prompt, initial.c_str());
+				if (result && result[0] != '\0') {
+					int page = atoi(result);
+					if (page < 1) page = 1;
+					if (page > pageCount) page = pageCount;
+					selectpage = page - 1;
+					g_pending_page_load = true;
+					renderLoadingScreen();
+				}
 				break;
+			}
 			case selectmanga: {
 				size_t n = getMangaListCount();
 				if (n == 0 || selectchapter < 0 || (size_t)selectchapter >= n)
@@ -1559,6 +1617,41 @@ void handlePCInput(SDL_Event& e) {
 		}
 		return;
 	}
+	if (g_goto_page_input_mode) {
+		if (e.type == SDL_KEYDOWN) {
+			if (e.key.keysym.sym == SDLK_ESCAPE) {
+				g_goto_page_input_mode = false;
+				SDL_StopTextInput();
+				return;
+			}
+			if (e.key.keysym.sym == SDLK_RETURN || e.key.keysym.sym == SDLK_KP_ENTER) {
+				int pageCount = (int)arraychapter.size();
+				int page = selectpage + 1;
+				if (!g_goto_page_input.empty()) {
+					page = atoi(g_goto_page_input.c_str());
+					if (page < 1) page = 1;
+					if (page > pageCount) page = pageCount;
+				}
+				selectpage = page - 1;
+				g_pending_page_load = true;
+				g_goto_page_input_mode = false;
+				SDL_StopTextInput();
+				renderLoadingScreen();
+				return;
+			}
+			if (e.key.keysym.sym == SDLK_BACKSPACE) {
+				if (!g_goto_page_input.empty()) g_goto_page_input.pop_back();
+				return;
+			}
+		}
+		if (e.type == SDL_TEXTINPUT) {
+			for (int i = 0; e.text.text[i] != '\0'; i++)
+				if (e.text.text[i] >= '0' && e.text.text[i] <= '9')
+					g_goto_page_input += e.text.text[i];
+			return;
+		}
+		return;
+	}
 #endif
 	if (e.type == SDL_QUIT) { cancelcurl = 1; quit = 1; }
 	else if (e.type == SDL_KEYDOWN) {
@@ -1576,8 +1669,9 @@ void handlePCInput(SDL_Event& e) {
 			case selectmanga:
 				g_cbz_open_error_msg.clear();
 				if (selectchapter < (int)getMangaListCount() - 1) {
-					selectchapter++; baseymain = baseymain - 20;
-				} else { selectchapter = 0; baseymain = 30; }
+					selectchapter++;
+					baseymain -= LIST_LINE_HEIGHT;
+				} else { selectchapter = 0; baseymain = LIST_TOP; }
 				break;
 			}
 			break;
@@ -1592,11 +1686,15 @@ void handlePCInput(SDL_Event& e) {
 				break;
 			case selectmanga:
 				g_cbz_open_error_msg.clear();
-				if (selectchapter > 0) { selectchapter--; baseymain = baseymain + 20; }
+				if (selectchapter > 0) { selectchapter--; baseymain += LIST_LINE_HEIGHT; }
 				else {
 					size_t n = getMangaListCount();
-					baseymain = (n > 0) ? (30 - 20 * ((int)n - 1)) : 30;
 					selectchapter = (n > 0) ? (int)n - 1 : 0;
+					if (n > 0) {
+						int max_vis = getListMaxVisible();
+						baseymain = LIST_TOP + LIST_LINE_HEIGHT * (max_vis - (int)n);
+						if (baseymain > LIST_TOP) baseymain = LIST_TOP;
+					}
 				}
 				break;
 			}
@@ -1605,7 +1703,11 @@ void handlePCInput(SDL_Event& e) {
 			if (existfoldermain) {
 				switch (statenow) {
 				case readmanga:
-					if (cascade == false) { basey = 0; adjust = !adjust; } else adjust = !adjust;
+#ifndef __SWITCH__
+					g_goto_page_input_mode = true;
+					g_goto_page_input = std::to_string(selectpage + 1);
+					SDL_StartTextInput();
+#endif
 					break;
 				case selectmanga: {
 					size_t n = getMangaListCount();
@@ -1863,13 +1965,13 @@ void renderFrame() {
 				gTextTexture.loadFromRenderedText(gFont, "Cascade is disabled, enable it in the Main Menu.", { 0, 0, 0 });
 			gTextTexture.render(tx - gTextTexture.getWidth() / 2, ty);
 			ty += 28;
-			gTextTexture.loadFromRenderedText(gFont, "Press \"A\" for Fit Mode (On/Off).", { 0, 0, 0 });
+			gTextTexture.loadFromRenderedText(gFont, "Press \"A\" for Go to page.", { 0, 0, 0 });
 			gTextTexture.render(tx - gTextTexture.getWidth() / 2, ty);
 			ty += 28;
 			gTextTexture.loadFromRenderedText(gFont, "Press \"L\" for Previous page and \"R\" for Next page.", { 0, 0, 0 });
 			gTextTexture.render(tx - gTextTexture.getWidth() / 2, ty);
 			ty += 28;
-			gTextTexture.loadFromRenderedText(gFont, "Press \"ZL, ZR and R3\" for Zoom Mode.", { 0, 0, 0 });
+			gTextTexture.loadFromRenderedText(gFont, "Press \"R3\" for Zoom Mode.", { 0, 0, 0 });
 			gTextTexture.render(tx - gTextTexture.getWidth() / 2, ty);
 			ty += 28;
 			gTextTexture.loadFromRenderedText(gFont, "Press \"L3\" for show/hide this.", { 0, 0, 0 });
@@ -1889,10 +1991,14 @@ void renderFrame() {
 			gTextTexture.loadFromRenderedText(gFont3, "in a folder without Latin characters.", { 0, 0, 0 });
 			gTextTexture.render(g_view_w / 2 - gTextTexture.getWidth() / 2, 160);
 		}
+		clampListScroll();
 		{
 			size_t listCount = getMangaListCount();
+			int list_view_h = getListMaxVisible() * LIST_LINE_HEIGHT;
+			SDL_Rect listClip = { 0, LIST_TOP, g_view_w, list_view_h };
+			SDL_RenderSetClipRect(gRenderer, &listClip);
 			for (size_t x = 0; x < listCount; x++) {
-				int ypos = baseymain + ((int)x * 22);
+				int ypos = baseymain + (int)x * LIST_LINE_HEIGHT;
 				if ((int)x == selectchapter) {
 					Heart.render(basexmain + 12, ypos);
 					gTextTexture.loadFromRenderedText(gFont, getMangaName(x), { 120, 120, 120 });
@@ -1902,6 +2008,7 @@ void renderFrame() {
 					gTextTexture.render(basexmain, ypos);
 				}
 			}
+			SDL_RenderSetClipRect(gRenderer, NULL);
 		}
 		{
 			SDL_Rect fillRect = { 0, g_view_h - 35, 1280, 25 };
@@ -1950,6 +2057,23 @@ void renderFrame() {
 		gTextTexture.loadFromRenderedText(gFont, prompt.c_str(), { 50, 50, 50 });
 		gTextTexture.render(boxX + 8, boxY + (boxH - gTextTexture.getHeight()) / 2);
 		gTextTexture.loadFromRenderedText(gFont, "Enter = done, Escape = cancel", { 80, 80, 80 });
+		gTextTexture.render(boxX + 8, boxY + boxH - 18);
+	}
+	if (g_goto_page_input_mode && statenow == readmanga) {
+		SDL_Rect overlay = { 0, 0, g_view_w, g_view_h };
+		SDL_SetRenderDrawColor(gRenderer, 0, 0, 0, 180);
+		SDL_RenderFillRect(gRenderer, &overlay);
+		int pageCount = (int)arraychapter.size();
+		int boxW = 400, boxH = 80, boxX = (g_view_w - boxW) / 2, boxY = (g_view_h - boxH) / 2;
+		SDL_Rect box = { boxX, boxY, boxW, boxH };
+		SDL_SetRenderDrawColor(gRenderer, 255, 255, 255, 255);
+		SDL_RenderFillRect(gRenderer, &box);
+		SDL_SetRenderDrawColor(gRenderer, 100, 100, 100, 255);
+		SDL_RenderDrawRect(gRenderer, &box);
+		std::string prompt = "Go to page (1-" + std::to_string(pageCount) + "): " + g_goto_page_input + "|";
+		gTextTexture.loadFromRenderedText(gFont, prompt.c_str(), { 50, 50, 50 });
+		gTextTexture.render(boxX + 8, boxY + (boxH - gTextTexture.getHeight()) / 2);
+		gTextTexture.loadFromRenderedText(gFont, "Enter = go, Escape = cancel", { 80, 80, 80 });
 		gTextTexture.render(boxX + 8, boxY + boxH - 18);
 	}
 #endif
