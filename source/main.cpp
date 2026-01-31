@@ -750,9 +750,9 @@ static bool loadCbrPageIntoTexture(const char* cbrPath, int pageIndex, LTexture*
 }
 #endif
 
-// Load a page from arraychapter entry (file path or "cbz:path:pageIndex" or "cbr:path:pageIndex")
+// Load a page from arraychapter entry (file path or "cbz:path:pageIndex", "cbr:path:pageIndex", "pdf:path:pageIndex")
 static void loadPageIntoTexture(const std::string& entry, LTexture* tex) {
-	if (entry.size() > 4 && entry.compare(0, 4, "cbz:") == 0) {
+	if (entry.size() > 4 && (entry.compare(0, 4, "cbz:") == 0 || entry.compare(0, 4, "pdf:") == 0)) {
 		size_t lastColon = entry.rfind(':');
 		if (lastColon != std::string::npos && lastColon > 4) {
 			std::string path = entry.substr(4, lastColon - 4);
@@ -784,7 +784,7 @@ extern std::vector<std::string> arraychapter;  // defined later in file
 static std::string getCurrentMangaPath() {
 	if (arraychapter.empty()) return "";
 	const std::string& first = arraychapter[0];
-	if (first.size() > 4 && (first.compare(0, 4, "cbz:") == 0 || first.compare(0, 4, "cbr:") == 0)) {
+	if (first.size() > 4 && (first.compare(0, 4, "cbz:") == 0 || first.compare(0, 4, "cbr:") == 0 || first.compare(0, 4, "pdf:") == 0)) {
 		size_t lastColon = first.rfind(':');
 		if (lastColon != std::string::npos && lastColon > 4)
 			return first.substr(4, lastColon - 4);
@@ -1023,7 +1023,7 @@ void loadFolderList(const std::string& foldermain) {
 #ifdef CBR_SUPPORT
 				|| (name.size() >= 4 && name.compare(name.size() - 4, 4, ".cbr") == 0)
 #endif
-				;
+				|| (name.size() >= 4 && name.compare(name.size() - 4, 4, ".pdf") == 0);
 			if (is_dir || is_archive) {
 				printf("%s\n", entmain->d_name);
 				entries.push_back(std::make_pair(name, is_dir));
@@ -1414,6 +1414,32 @@ void handleSwitchInput(u64 kDown, u64 kHeld) {
 						break;
 					}
 #endif
+					bool isPdf = (fname.size() >= 4 && fname.compare(fname.size() - 4, 4, ".pdf") == 0);
+					if (isPdf) {
+						int pageCount = listPagesFromCbz(archPath.c_str());
+						if (pageCount <= 0) {
+							if (g_cbz_open_error == CBZ_ERR_FILE_NOT_FOUND)
+								g_cbz_open_error_msg = "File not found. Put PDF in sdmc:/CuteManga/";
+							else if (g_cbz_open_error == CBZ_ERR_NOT_ZIP)
+								g_cbz_open_error_msg = "Not a valid PDF file.";
+							else g_cbz_open_error_msg = "No pages in PDF.";
+						} else {
+							arraychapter.clear();
+							for (int i = 0; i < pageCount; i++)
+								arraychapter.push_back(std::string("pdf:") + archPath + ":" + std::to_string(i));
+							selectpage = 0;
+							int savedPage = loadReadingProgress(g_foldermain, archPath);
+							if (savedPage >= 0 && savedPage < pageCount) selectpage = savedPage;
+							bool ok = loadCbzPageIntoTexture(archPath.c_str(), selectpage, &Pagemanga);
+							arraypage.resize(arraychapter.size());
+							if (cascadeactivated) {
+								for (int x = 0; x < pageCount; x++)
+									loadCbzPageIntoTexture(archPath.c_str(), x, &arraypage[x]);
+							}
+							if (ok) { statenow = readmanga; helppage = true; }
+						}
+						break;
+					}
 					int pageCount = listPagesFromCbz(archPath.c_str());
 					if (pageCount <= 0) {
 						if (g_cbz_open_error == CBZ_ERR_FILE_NOT_FOUND)
@@ -1616,6 +1642,26 @@ void handlePCInput(SDL_Event& e) {
 							break;
 						}
 #endif
+						bool isPdf = (fname.size() >= 4 && fname.compare(fname.size() - 4, 4, ".pdf") == 0);
+						if (isPdf) {
+							int pageCount = listPagesFromCbz(archPath.c_str());
+							if (pageCount <= 0) {
+								if (g_cbz_open_error == CBZ_ERR_FILE_NOT_FOUND) g_cbz_open_error_msg = "File not found. Put PDF in sdmc:/CuteManga/";
+								else if (g_cbz_open_error == CBZ_ERR_NOT_ZIP) g_cbz_open_error_msg = "Not a valid PDF file.";
+								else g_cbz_open_error_msg = "No pages in PDF.";
+							} else {
+								arraychapter.clear();
+								for (int i = 0; i < pageCount; i++) arraychapter.push_back(std::string("pdf:") + archPath + ":" + std::to_string(i));
+								selectpage = 0;
+								int savedPage = loadReadingProgress(g_foldermain, archPath);
+								if (savedPage >= 0 && savedPage < pageCount) selectpage = savedPage;
+								bool ok = loadCbzPageIntoTexture(archPath.c_str(), selectpage, &Pagemanga);
+								arraypage.resize(arraychapter.size());
+								if (cascadeactivated) for (int x = 0; x < pageCount; x++) loadCbzPageIntoTexture(archPath.c_str(), x, &arraypage[x]);
+								if (ok) { statenow = readmanga; helppage = true; }
+							}
+							break;
+						}
 						int pageCount = listPagesFromCbz(archPath.c_str());
 						if (pageCount <= 0) {
 							if (g_cbz_open_error == CBZ_ERR_FILE_NOT_FOUND) g_cbz_open_error_msg = "File not found. Put CBZ in sdmc:/CuteManga/";
@@ -1871,11 +1917,12 @@ void renderFrame() {
 			if (sel_is_archive) {
 				std::string name = (selectchapter < (int)getMangaListCount()) ? getMangaName((size_t)selectchapter) : "";
 				bool is_cbz = (name.size() >= 4 && name.compare(name.size() - 4, 4, ".cbz") == 0);
+				bool is_pdf = (name.size() >= 4 && name.compare(name.size() - 4, 4, ".pdf") == 0);
 #ifdef CBR_SUPPORT
 				bool is_cbr = (name.size() >= 4 && name.compare(name.size() - 4, 4, ".cbr") == 0);
-				bool is_archive_read = is_cbz || is_cbr;
+				bool is_archive_read = is_cbz || is_cbr || is_pdf;
 #else
-				bool is_archive_read = is_cbz;
+				bool is_archive_read = is_cbz || is_pdf;
 #endif
 				gTextTexture.loadFromRenderedText(gFont, is_archive_read ? "Press \"A\" to read. Press \"B\" to search. " : "Press \"A\" to open. Press \"B\" to search. ", textColor);
 				gTextTexture.render(basexmain, g_view_h - 30);

@@ -1,6 +1,6 @@
 # CuteManga
 
-A manga and comic reader for **Nintendo Switch** (homebrew). Read **CBZ** (ZIP) and **CBR** (RAR) comics and image-based manga from your SD card in landscape or portrait, with zoom, fit mode, and cascade viewing.
+A manga and comic reader for **Nintendo Switch** (homebrew). Read **CBZ** (ZIP), **CBR** (RAR), **PDF** comics and image-based manga from your SD card in landscape or portrait, with zoom, fit mode, and cascade viewing.
 
 **Version:** 1.0.6 (see [Releases](https://github.com/pinheiroam/CuteManga/releases) for builds)
 
@@ -9,6 +9,7 @@ A manga and comic reader for **Nintendo Switch** (homebrew). Read **CBZ** (ZIP) 
 ## Features
 
 - **CBZ support** — Read ZIP-based comic archives (`.cbz`) using MuPDF. High-quality rendering with configurable scale.
+- **PDF support** — Read PDF documents (`.pdf`) using MuPDF. Same rendering and controls as CBZ.
 - **CBR support** (optional) — Read RAR-based comic archives (`.cbr`) when built with [unarr](https://github.com/selmf/unarr). Requires building unarr for Switch (see Build).
 - **Image folders** — Browse folders of images (PNG, JPG, etc.) as manga chapters.
 - **Portrait & landscape** — Toggle orientation anytime with the **Y** button for comfortable reading.
@@ -23,12 +24,12 @@ A manga and comic reader for **Nintendo Switch** (homebrew). Read **CBZ** (ZIP) 
 ## How to use
 
 1. **Create a folder** on the root of your SD card named **`CuteManga`**.
-2. Put your **CBZ** (and optionally **CBR**) files and/or **image folders** (manga/comic chapters) inside `CuteManga`.
+2. Put your **CBZ**, **PDF** (and optionally **CBR**) files and/or **image folders** (manga/comic chapters) inside `CuteManga`.
 3. **Folder names** — Avoid Latin/special characters (ñ, á, í, etc.) in folder and file names; use plain ASCII if you have loading issues.
-4. **CBZ** — ZIP-based `.cbz` files are always supported. **CBR** (RAR-based `.cbr`) is supported only if the app was built with unarr (see Build).
+4. **CBZ** and **PDF** — Always supported (MuPDF). **CBR** (RAR-based `.cbr`) is supported only if the app was built with unarr (see Build).
 5. Copy the **`.nro`** build to your Switch (e.g. via SD or your usual homebrew launcher) and run **CuteManga**.
 
-**Path example:** `sdmc:/CuteManga/YourComic.cbz` or `sdmc:/CuteManga/ChapterName/` (folder of images).
+**Path example:** `sdmc:/CuteManga/YourComic.cbz`, `sdmc:/CuteManga/Book.pdf`, or `sdmc:/CuteManga/ChapterName/` (folder of images).
 
 ---
 
