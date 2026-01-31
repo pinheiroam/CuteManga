@@ -23,6 +23,7 @@
 #include <errno.h>
 #include <sys/stat.h>
 #include <stdio.h>
+#include <string.h>
 #include <string>
 #include <cmath>
 #include <iostream>
@@ -170,15 +171,16 @@ private:
 //Frees media and shuts down SDL
 void close();
 
-// CBZ loading progress (0-100, message)
-int g_loading_pct = 0;
-std::string g_loading_msg;
-void renderLoadingProgress();
+// When true, footer shows "Loading" and we load the page after the frame
+bool g_pending_page_load = false;
 
 // CBZ open failure reason for UI
 enum { CBZ_ERR_NONE = 0, CBZ_ERR_FILE_NOT_FOUND = 1, CBZ_ERR_NOT_ZIP = 2 };
 int g_cbz_open_error = CBZ_ERR_NONE;
 std::string g_cbz_mupdf_error;  // MuPDF error message when CBZ_ERR_NOT_ZIP
+std::string g_cbz_open_error_msg;  // Message to show in selectmanga footer on open failure
+
+void renderLoadingScreen();  // Full-screen "Loading" then present (for CBZ open)
 
 // MuPDF: context (created at init), current CBZ document (open while viewing)
 fz_context* g_mupdf_ctx = NULL;
@@ -503,14 +505,6 @@ static bool naturalSortCompare(const std::string& a, const std::string& b) {
 	return (i >= a.size() && j < b.size());
 }
 
-typedef void (*CbzProgressFn)(int pct, const char* msg);
-
-static void cbzProgressUpdate(int pct, const char* msg) {
-	g_loading_pct = pct;
-	g_loading_msg = msg ? msg : "";
-	renderLoadingProgress();
-}
-
 // Open CBZ with MuPDF; sets g_mupdf_doc and g_mupdf_path. Returns page count or -1 on error.
 static int openCbzWithMupdf(const char* cbzPath) {
 	g_cbz_open_error = CBZ_ERR_NONE;
@@ -549,11 +543,8 @@ static int openCbzWithMupdf(const char* cbzPath) {
 }
 
 // List "pages" for CBZ: returns count; caller fills arraychapter with cbz:path:0, cbz:path:1, ...
-static int listPagesFromCbz(const char* cbzPath, CbzProgressFn onProgress = nullptr) {
-	if (onProgress) { onProgress(10, "Opening CBZ..."); renderLoadingProgress(); }
-	int n = openCbzWithMupdf(cbzPath);
-	if (onProgress && n > 0) { onProgress(50, "Ready."); renderLoadingProgress(); }
-	return n;
+static int listPagesFromCbz(const char* cbzPath) {
+	return openCbzWithMupdf(cbzPath);
 }
 
 // Render CBZ page (0-based) into texture. g_mupdf_doc must be open for this path.
@@ -613,23 +604,115 @@ static void loadPageIntoTexture(const std::string& entry, LTexture* tex) {
 	tex->loadFromFile(entry);
 }
 
-void renderLoadingProgress() {
+//-----------------------------------------------------------------------------
+// Reading progress: one file (reading_progress.txt) stores each manga's
+// last page; one line per manga: "path\tpage\n". Save on page change, restore on open.
+// Uses static buffer (not stack) for devkitA64 / limited stack.
+//-----------------------------------------------------------------------------
+extern std::vector<std::string> arraychapter;  // defined later in file
+static std::string getCurrentMangaPath() {
+	if (arraychapter.empty()) return "";
+	const std::string& first = arraychapter[0];
+	if (first.size() > 4 && first.compare(0, 4, "cbz:") == 0) {
+		size_t lastColon = first.rfind(':');
+		if (lastColon != std::string::npos && lastColon > 4)
+			return first.substr(4, lastColon - 4);
+	} else {
+		size_t lastSlash = first.rfind('/');
+		if (lastSlash != std::string::npos)
+			return first.substr(0, lastSlash + 1);
+	}
+	return "";
+}
+
+#define READING_PROGRESS_MAX_ENTRIES 64
+#define READING_PROGRESS_MAX_PATH 384
+
+// Returns saved page index (0-based) or -1 if not found.
+static int loadReadingProgress(const std::string& foldermain, const std::string& mangaPath) {
+	char pathbuf[READING_PROGRESS_MAX_PATH];
+	size_t flen = foldermain.size();
+	if (flen + 24 >= sizeof(pathbuf)) return -1;
+	memcpy(pathbuf, foldermain.c_str(), flen + 1);
+	strcat(pathbuf, "reading_progress.txt");
+	FILE* f = fopen(pathbuf, "r");
+	if (!f) return -1;
+	char line[1024];
+	int page = -1;
+	while (fgets(line, (int)sizeof(line), f)) {
+		char* tab = strchr(line, '\t');
+		if (!tab) continue;
+		*tab = '\0';
+		if (strcmp(line, mangaPath.c_str()) == 0)
+			page = atoi(tab + 1);
+		*tab = '\t';
+	}
+	fclose(f);
+	return page;
+}
+
+// Static buffer so we don't use ~25KB+ stack (Switch has limited stack).
+static struct { char path[READING_PROGRESS_MAX_PATH]; int page; } s_progress_entries[READING_PROGRESS_MAX_ENTRIES];
+
+// Updates progress: read all entries, update this manga's page, write all back.
+static void saveReadingProgress(const std::string& foldermain, const std::string& mangaPath, int pageIndex) {
+	char pathbuf[READING_PROGRESS_MAX_PATH];
+	size_t flen = foldermain.size();
+	if (flen + 24 >= sizeof(pathbuf)) return;
+	memcpy(pathbuf, foldermain.c_str(), flen + 1);
+	strcat(pathbuf, "reading_progress.txt");
+	int n_entries = 0;
+	FILE* f = fopen(pathbuf, "r");
+	if (f) {
+		char line[1024];
+		while (n_entries < READING_PROGRESS_MAX_ENTRIES && fgets(line, (int)sizeof(line), f)) {
+			char* tab = strchr(line, '\t');
+			if (!tab) continue;
+			*tab = '\0';
+			size_t plen = (size_t)(tab - line);
+			if (plen >= (size_t)READING_PROGRESS_MAX_PATH) { *tab = '\t'; continue; }
+			memcpy(s_progress_entries[n_entries].path, line, plen + 1);
+			s_progress_entries[n_entries].page = atoi(tab + 1);
+			n_entries++;
+			*tab = '\t';
+		}
+		fclose(f);
+	}
+	int found = -1;
+	for (int i = 0; i < n_entries; i++) {
+		if (strcmp(s_progress_entries[i].path, mangaPath.c_str()) == 0) { found = i; break; }
+	}
+	if (found >= 0)
+		s_progress_entries[found].page = pageIndex;
+	else if (n_entries < READING_PROGRESS_MAX_ENTRIES && (int)mangaPath.size() < READING_PROGRESS_MAX_PATH) {
+		strncpy(s_progress_entries[n_entries].path, mangaPath.c_str(), READING_PROGRESS_MAX_PATH - 1);
+		s_progress_entries[n_entries].path[READING_PROGRESS_MAX_PATH - 1] = '\0';
+		s_progress_entries[n_entries].page = pageIndex;
+		n_entries++;
+	}
+	f = fopen(pathbuf, "w");
+	if (!f) return;
+	for (int j = 0; j < n_entries; j++)
+		fprintf(f, "%s\t%d\n", s_progress_entries[j].path, s_progress_entries[j].page);
+	fclose(f);
+}
+
+void renderLoadingScreen() {
+	if (g_portrait_mode && g_portrait_texture != NULL)
+		SDL_SetRenderTarget(gRenderer, g_portrait_texture);
 	SDL_SetRenderDrawColor(gRenderer, 233, 234, 237, 0xFF);
 	SDL_RenderClear(gRenderer);
-	int barX = 140, barY = 340, barW = 1000, barH = 36;
-	SDL_Rect bg = { barX, barY, barW, barH };
-	SDL_SetRenderDrawColor(gRenderer, 200, 200, 200, 255);
-	SDL_RenderFillRect(gRenderer, &bg);
-	SDL_SetRenderDrawColor(gRenderer, 80, 140, 220, 255);
-	SDL_Rect fill = { barX + 2, barY + 2, (barW - 4) * g_loading_pct / 100, barH - 4 };
-	if (fill.w > 0) SDL_RenderFillRect(gRenderer, &fill);
-	char pctBuf[32];
-	snprintf(pctBuf, sizeof(pctBuf), "%d%%", g_loading_pct);
 	if (gFont) {
-		gTextTexture.loadFromRenderedText(gFont, g_loading_msg.empty() ? "Loading..." : g_loading_msg.c_str(), { 50, 50, 50 });
-		gTextTexture.render(g_view_w / 2 - gTextTexture.getWidth() / 2, barY - 30);
-		gTextTexture.loadFromRenderedText(gFont, pctBuf, { 0, 0, 0 });
-		gTextTexture.render(g_view_w / 2 - gTextTexture.getWidth() / 2, barY + barH + 8);
+		gTextTexture.loadFromRenderedText(gFont, "Loading", { 50, 50, 50 });
+		gTextTexture.render(g_view_w / 2 - gTextTexture.getWidth() / 2, g_view_h / 2 - gTextTexture.getHeight() / 2);
+	}
+	if (g_portrait_mode && g_portrait_texture != NULL) {
+		SDL_SetRenderTarget(gRenderer, NULL);
+		SDL_SetRenderDrawColor(gRenderer, 0, 0, 0, 255);
+		SDL_RenderClear(gRenderer);
+		SDL_Rect dest = { (1280 - 720) / 2, (720 - 1280) / 2, 720, 1280 };
+		SDL_Point center = { 360, 640 };
+		SDL_RenderCopyEx(gRenderer, g_portrait_texture, NULL, &dest, -90.0, &center, SDL_FLIP_NONE);
 	}
 	SDL_RenderPresent(gRenderer);
 	SDL_PumpEvents();
@@ -782,6 +865,7 @@ std::string gethtml(std::string enlace)
 		curl_easy_cleanup(curl);
 		return Buffer;
 	}
+	return "";
 }
 void downloadfile(std::string enlace, std::string directorydown)
 {
@@ -983,7 +1067,6 @@ int main(int argc, char **argv)
 
 
 	bool cascade = false;
-	int cascadesize = 0;
 	bool separation = false;
 	bool adjust = true;
 	int speed = 15;
@@ -1036,10 +1119,6 @@ int main(int argc, char **argv)
         // padGetButtons returns the set of buttons that are currently pressed
         u64 kHeld = padGetButtons(&pad);
 
-        // padGetButtonsUp returns the set of buttons that have been
-        // newly released in this frame compared to the previous one
-        u64 kUp = padGetButtonsUp(&pad);
-
 		if (kDown & HidNpadButton_Plus)
 		{
 			quit = 1;
@@ -1087,6 +1166,7 @@ int main(int argc, char **argv)
 			
 
 			case selectmanga:
+				g_cbz_open_error_msg.clear();
 				if (selectchapter < arraymain.size() - 1)
 				{
 					selectchapter++;
@@ -1139,6 +1219,7 @@ int main(int argc, char **argv)
 			switch (statenow)
 			{
 			case selectmanga:
+				g_cbz_open_error_msg.clear();
 				if (selectchapter > 0)
 				{
 					selectchapter--;
@@ -1226,16 +1307,13 @@ int main(int argc, char **argv)
 					zoom = 1;
 					if (selectpage > 0)
 					{
-						Pagemanga.free();
 						selectpage--;
-						loadPageIntoTexture(arraychapter[selectpage], &Pagemanga);
-
+						g_pending_page_load = true;
 					}
 					else
 					{
-						Pagemanga.free();
 						selectpage = 0;
-						loadPageIntoTexture(arraychapter[selectpage], &Pagemanga);
+						g_pending_page_load = true;
 					}
 				}
 				else
@@ -1261,10 +1339,8 @@ int main(int argc, char **argv)
 					zoom = 1;
 					if (selectpage < arraychapter.size() - 1)
 					{
-						Pagemanga.free();
 						selectpage++;
-						loadPageIntoTexture(arraychapter[selectpage], &Pagemanga);
-
+						g_pending_page_load = true;
 					}
 				}
 				else
@@ -1331,7 +1407,9 @@ int main(int argc, char **argv)
 					break;
 				case selectmanga:
 					if (selectchapter < (int)arraymain_is_dir.size() && !arraymain_is_dir[selectchapter]) {
-						// Archive selected: try CBZ (ZIP); show progress bar
+						// Archive selected: try CBZ (ZIP)
+						g_cbz_open_error = CBZ_ERR_NONE;
+						g_cbz_open_error_msg.clear();
 						std::string fname = arraymain[selectchapter];
 						size_t start = fname.find_first_not_of(" \t\r\n");
 						size_t end = fname.find_last_not_of(" \t\r\n");
@@ -1339,49 +1417,35 @@ int main(int argc, char **argv)
 						std::string archPath = foldermain + fname;
 						for (size_t i = 0; i < archPath.size(); i++)
 							if (archPath[i] == '\\') archPath[i] = '/';
-						g_loading_pct = 0;
-						g_loading_msg = "Opening CBZ...";
-						renderLoadingProgress();
-						int pageCount = listPagesFromCbz(archPath.c_str(), cbzProgressUpdate);
+						renderLoadingScreen();
+						int pageCount = listPagesFromCbz(archPath.c_str());
 						if (pageCount <= 0) {
 							if (g_cbz_open_error == CBZ_ERR_FILE_NOT_FOUND)
-								g_loading_msg = "File not found. Put CBZ in sdmc:/CuteManga/";
+								g_cbz_open_error_msg = "File not found. Put CBZ in sdmc:/CuteManga/";
 							else if (g_cbz_open_error == CBZ_ERR_NOT_ZIP) {
 								if (g_cbz_mupdf_error.empty())
-									g_loading_msg = "Not a valid CBZ file.";
+									g_cbz_open_error_msg = "Not a valid CBZ file.";
 								else if (g_cbz_mupdf_error.find("cannot recognize archive") != std::string::npos)
-									g_loading_msg = "Not a ZIP. Use ZIP-based CBZ (not RAR/CBR).";
+									g_cbz_open_error_msg = "Not a ZIP. Use ZIP-based CBZ (not RAR/CBR).";
 								else
-									g_loading_msg = "CBZ: " + g_cbz_mupdf_error;
+									g_cbz_open_error_msg = "CBZ: " + g_cbz_mupdf_error;
 							}
 							else
-								g_loading_msg = "No pages in CBZ.";
-							g_loading_pct = 0;
-							for (int wait = 0; wait < 60; wait++) {
-								renderLoadingProgress();
-								SDL_Delay(50);
-							}
+								g_cbz_open_error_msg = "No pages in CBZ.";
 						} else {
-							g_loading_pct = 40;
-							g_loading_msg = "Loading first page...";
-							renderLoadingProgress();
 							arraychapter.clear();
 							for (int i = 0; i < pageCount; i++)
 								arraychapter.push_back(std::string("cbz:") + archPath + ":" + std::to_string(i));
 							selectpage = 0;
-							bool ok = loadCbzPageIntoTexture(archPath.c_str(), 0, &Pagemanga);
+							int savedPage = loadReadingProgress(foldermain, archPath);
+							if (savedPage >= 0 && savedPage < pageCount)
+								selectpage = savedPage;
+							bool ok = loadCbzPageIntoTexture(archPath.c_str(), selectpage, &Pagemanga);
 							arraypage.resize(arraychapter.size());
 							if (cascadeactivated) {
-								for (int x = 0; x < pageCount; x++) {
-									g_loading_pct = 50 + (int)(50 * (x + 1) / pageCount);
-									g_loading_msg = "Loading pages...";
-									renderLoadingProgress();
+								for (int x = 0; x < pageCount; x++)
 									loadCbzPageIntoTexture(archPath.c_str(), x, &arraypage[x]);
-								}
 							}
-							g_loading_pct = 100;
-							g_loading_msg = "Done";
-							renderLoadingProgress();
 							if (ok) {
 								statenow = readmanga;
 								helppage = true;
@@ -1411,6 +1475,9 @@ int main(int argc, char **argv)
 					}
 
 					if (arraychapter.size() > 0) {
+						int savedPage = loadReadingProgress(foldermain, foldertoread);
+						if (savedPage >= 0 && savedPage < (int)arraychapter.size())
+							selectpage = savedPage;
 						loadPageIntoTexture(arraychapter[selectpage], &Pagemanga);
 						arraypage.resize(arraychapter.size());
 
@@ -1559,6 +1626,7 @@ int main(int argc, char **argv)
 						break;
 
 					case selectmanga:
+						g_cbz_open_error_msg.clear();
 						if (selectchapter < arraymain.size() - 1)
 						{
 							selectchapter++;
@@ -1604,6 +1672,7 @@ int main(int argc, char **argv)
 						}
 						break;
 					case selectmanga:
+						g_cbz_open_error_msg.clear();
 						if (selectchapter > 0)
 						{
 							selectchapter--;
@@ -1635,6 +1704,8 @@ int main(int argc, char **argv)
 							break;
 						case selectmanga:
 							if (selectchapter < (int)arraymain_is_dir.size() && !arraymain_is_dir[selectchapter]) {
+								g_cbz_open_error = CBZ_ERR_NONE;
+								g_cbz_open_error_msg.clear();
 								std::string fname = arraymain[selectchapter];
 								size_t start = fname.find_first_not_of(" \t\r\n");
 								size_t end = fname.find_last_not_of(" \t\r\n");
@@ -1642,49 +1713,35 @@ int main(int argc, char **argv)
 								std::string archPath = foldermain + fname;
 								for (size_t i = 0; i < archPath.size(); i++)
 									if (archPath[i] == '\\') archPath[i] = '/';
-								g_loading_pct = 0;
-								g_loading_msg = "Opening CBZ...";
-								renderLoadingProgress();
-								int pageCount = listPagesFromCbz(archPath.c_str(), cbzProgressUpdate);
+								renderLoadingScreen();
+								int pageCount = listPagesFromCbz(archPath.c_str());
 								if (pageCount <= 0) {
 									if (g_cbz_open_error == CBZ_ERR_FILE_NOT_FOUND)
-										g_loading_msg = "File not found. Put CBZ in sdmc:/CuteManga/";
+										g_cbz_open_error_msg = "File not found. Put CBZ in sdmc:/CuteManga/";
 									else if (g_cbz_open_error == CBZ_ERR_NOT_ZIP) {
 										if (g_cbz_mupdf_error.empty())
-											g_loading_msg = "Not a valid CBZ file.";
+											g_cbz_open_error_msg = "Not a valid CBZ file.";
 										else if (g_cbz_mupdf_error.find("cannot recognize archive") != std::string::npos)
-											g_loading_msg = "Not a ZIP. Use ZIP-based CBZ (not RAR/CBR).";
+											g_cbz_open_error_msg = "Not a ZIP. Use ZIP-based CBZ (not RAR/CBR).";
 										else
-											g_loading_msg = "CBZ: " + g_cbz_mupdf_error;
+											g_cbz_open_error_msg = "CBZ: " + g_cbz_mupdf_error;
 									}
 									else
-										g_loading_msg = "No pages in CBZ.";
-									g_loading_pct = 0;
-									for (int wait = 0; wait < 60; wait++) {
-										renderLoadingProgress();
-										SDL_Delay(50);
-									}
+										g_cbz_open_error_msg = "No pages in CBZ.";
 								} else {
-									g_loading_pct = 40;
-									g_loading_msg = "Loading first page...";
-									renderLoadingProgress();
 									arraychapter.clear();
 									for (int i = 0; i < pageCount; i++)
 										arraychapter.push_back(std::string("cbz:") + archPath + ":" + std::to_string(i));
 									selectpage = 0;
-									bool ok = loadCbzPageIntoTexture(archPath.c_str(), 0, &Pagemanga);
+									int savedPage = loadReadingProgress(foldermain, archPath);
+									if (savedPage >= 0 && savedPage < pageCount)
+										selectpage = savedPage;
+									bool ok = loadCbzPageIntoTexture(archPath.c_str(), selectpage, &Pagemanga);
 									arraypage.resize(arraychapter.size());
 									if (cascadeactivated) {
-										for (int x = 0; x < pageCount; x++) {
-											g_loading_pct = 50 + (int)(50 * (x + 1) / pageCount);
-											g_loading_msg = "Loading pages...";
-											renderLoadingProgress();
+										for (int x = 0; x < pageCount; x++)
 											loadCbzPageIntoTexture(archPath.c_str(), x, &arraypage[x]);
-										}
 									}
-									g_loading_pct = 100;
-									g_loading_msg = "Done";
-									renderLoadingProgress();
 									if (ok) {
 										statenow = readmanga;
 										helppage = true;
@@ -1711,6 +1768,9 @@ int main(int argc, char **argv)
 							}
 
 							if (arraychapter.size() > 0) {
+								int savedPage = loadReadingProgress(foldermain, foldertoread);
+								if (savedPage >= 0 && savedPage < (int)arraychapter.size())
+									selectpage = savedPage;
 								loadPageIntoTexture(arraychapter[selectpage], &Pagemanga);
 								arraypage.resize(arraychapter.size());
 								if (cascadeactivated == true) {
@@ -1779,12 +1839,10 @@ int main(int argc, char **argv)
 					break;
 
 				case SDLK_l:
-				
 					switch (statenow)
 					{
 					case readmanga:
 					{
-
 						if (cascade == false)
 						{
 							basey = 0;
@@ -1792,16 +1850,13 @@ int main(int argc, char **argv)
 							zoom = 1;
 							if (selectpage > 0)
 							{
-								Pagemanga.free();
 								selectpage--;
-								loadPageIntoTexture(arraychapter[selectpage], &Pagemanga);
-
+								g_pending_page_load = true;
 							}
 							else
 							{
-								Pagemanga.free();
 								selectpage = 0;
-								loadPageIntoTexture(arraychapter[selectpage], &Pagemanga);
+								g_pending_page_load = true;
 							}
 						}
 						else
@@ -1809,7 +1864,6 @@ int main(int argc, char **argv)
 							zoom = 1;
 						}
 					}
-
 					break;
 					}
 				break;
@@ -1818,7 +1872,6 @@ int main(int argc, char **argv)
 					switch (statenow)
 					{
 					case readmanga:
-
 						if (cascade == false)
 						{
 							basey = 0;
@@ -1826,21 +1879,16 @@ int main(int argc, char **argv)
 							zoom = 1;
 							if (selectpage < arraychapter.size() - 1)
 							{
-								Pagemanga.free();
 								selectpage++;
-								loadPageIntoTexture(arraychapter[selectpage], &Pagemanga);
-
+								g_pending_page_load = true;
 							}
 						}
 						else
 						{
-
 							zoom = 1;
 						}
 						break;
 					}
-
-
 					break;
 
 				case SDLK_z:
@@ -2008,11 +2056,10 @@ int main(int argc, char **argv)
 		switch (statenow)
 		{
 		case readmanga:
-			
 
 			if (cascade == true)
 			{
-				for (int x = 0; x < arraypage.size(); x++)
+				for (size_t x = 0; x < arraypage.size(); x++)
 
 				{
 
@@ -2082,6 +2129,34 @@ int main(int argc, char **argv)
 				}
 			}
 
+			// Footer: "Loading" when loading, always "Page X/Y"
+			{
+				int totalPages = (int)arraychapter.size();
+				int fy = g_view_h - 28;
+				int fw = 98;
+				int fx = g_view_w - fw - 12;
+				int leftFx = 12;
+				if (g_pending_page_load) {
+					// Wider footer: "Loading" left, "Page X/Y" right
+					int loadW = 78;
+					SDL_Rect leftBg = { leftFx, fy - 2, loadW + 8, 22 };
+					SDL_SetRenderDrawColor(gRenderer, 255, 255, 255, 230);
+					SDL_RenderFillRect(gRenderer, &leftBg);
+					SDL_SetRenderDrawColor(gRenderer, 200, 200, 200, 255);
+					SDL_RenderDrawRect(gRenderer, &leftBg);
+					gTextTexture.loadFromRenderedText(gFont, "Loading...", { 50, 50, 50 });
+					gTextTexture.render(leftFx + 4, fy);
+				}
+				SDL_Rect footerBg = { fx, fy - 2, fw + 8, 22 };
+				SDL_SetRenderDrawColor(gRenderer, 255, 255, 255, 230);
+				SDL_RenderFillRect(gRenderer, &footerBg);
+				SDL_SetRenderDrawColor(gRenderer, 200, 200, 200, 255);
+				SDL_RenderDrawRect(gRenderer, &footerBg);
+				char footerBuf[32];
+				snprintf(footerBuf, sizeof(footerBuf), "Page %d/%d", selectpage + 1, totalPages > 0 ? totalPages : 1);
+				gTextTexture.loadFromRenderedText(gFont, footerBuf, { 50, 50, 50 });
+				gTextTexture.render(fx + 4, fy);
+			}
 
 			if (zoom == 2) {
 				lupa.render(g_view_w - lupa.getWidth() - 10, g_view_h - lupa.getHeight() - 10);
@@ -2150,11 +2225,11 @@ int main(int argc, char **argv)
 			}
 		
 
-			for (int x = 0; x < arraymain.size(); x++) {
+			for (size_t x = 0; x < arraymain.size(); x++) {
 
 				
-				if (x == selectchapter) {
-					Heart.render(basexmain + 12,  baseymain + (x * 22));
+				if ((int)x == selectchapter) {
+					Heart.render(basexmain + 12,  baseymain + ((int)x * 22));
 				
 
 				}
@@ -2164,16 +2239,16 @@ int main(int argc, char **argv)
 
 				
 
-				if (x == selectchapter) {
+				if ((int)x == selectchapter) {
 					gTextTexture.loadFromRenderedText(gFont, arraymain[x], { 120, 120, 120 });
-					gTextTexture.render(basexmain + 30, baseymain +(x * 22));
+					gTextTexture.render(basexmain + 30, baseymain + ((int)x * 22));
 
 				}
 				else
 				{
 
 					gTextTexture.loadFromRenderedText(gFont, arraymain[x], { 50, 50, 50 });
-					gTextTexture.render(basexmain, baseymain + (x * 22));
+					gTextTexture.render(basexmain, baseymain + ((int)x * 22));
 
 				}
 
@@ -2184,6 +2259,10 @@ int main(int argc, char **argv)
 			SDL_RenderFillRect(gRenderer, &fillRect); }
 
 			textColor = { 50, 50, 50 };
+			if (!g_cbz_open_error_msg.empty()) {
+				gTextTexture.loadFromRenderedText(gFont, g_cbz_open_error_msg.c_str(), textColor);
+				gTextTexture.render(basexmain, g_view_h - 30);
+			} else {
 			bool sel_is_archive = (selectchapter < (int)arraymain_is_dir.size() && !arraymain_is_dir[selectchapter]);
 			if (sel_is_archive)
 			{
@@ -2205,10 +2284,11 @@ int main(int argc, char **argv)
 				gTextTexture.loadFromRenderedText(gFont, "\"A\" to read folder - \"X\" for Disable Cascade Mode (Instant load and Low Memory use). ", textColor);
 				gTextTexture.render(basexmain, g_view_h - 30);
 			}
+			}
+
 
 
 		
-
 			break;
 		
 
@@ -2230,7 +2310,15 @@ int main(int argc, char **argv)
 		}
 		SDL_RenderPresent(gRenderer);
 
-
+		// Deferred page load: show "Loading" one frame then load
+		if (g_pending_page_load && statenow == readmanga) {
+			Pagemanga.free();
+			loadPageIntoTexture(arraychapter[selectpage], &Pagemanga);
+			std::string mangaPath = getCurrentMangaPath();
+			if (!mangaPath.empty())
+				saveReadingProgress(foldermain, mangaPath, selectpage);
+			g_pending_page_load = false;
+		}
 	}
 	
 	
