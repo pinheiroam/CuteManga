@@ -73,6 +73,29 @@ const char *Keyboard_GetText(const char *guide_text, const char *initial_text) {
 	swkbdClose(&swkbd);
 	return input_string;
 }
+
+// Search: shows system keyboard as modal; allows empty (no validation).
+const char* Keyboard_GetTextSearch(const char* guide_text, const char* initial_text) {
+	Result ret = 0;
+	SwkbdConfig swkbd;
+	static char input_string[256];
+	input_string[0] = '\0';
+	if (R_FAILED(ret = swkbdCreate(&swkbd, 0))) {
+		swkbdClose(&swkbd);
+		return "";
+	}
+	swkbdConfigMakePresetDefault(&swkbd);
+	if (guide_text && strlen(guide_text) != 0)
+		swkbdConfigSetGuideText(&swkbd, guide_text);
+	if (initial_text && strlen(initial_text) != 0)
+		swkbdConfigSetInitialText(&swkbd, initial_text);
+	if (R_FAILED(ret = swkbdShow(&swkbd, input_string, sizeof(input_string)))) {
+		swkbdClose(&swkbd);
+		return "";
+	}
+	swkbdClose(&swkbd);
+	return input_string;
+}
 #endif 
 
 
@@ -229,6 +252,13 @@ std::vector<LTexture> arraypage;
 std::vector<std::string> arraymain;
 std::vector<bool> arraymain_is_dir;  // true = folder, false = .cbz file
 std::vector<std::string> arraychapter;
+
+std::string g_search_filter;
+std::vector<std::string> arraymain_filtered;
+std::vector<bool> arraymain_is_dir_filtered;
+#ifndef __SWITCH__
+bool g_search_input_mode = false;
+#endif
 
 LTexture::LTexture()
 {
@@ -806,9 +836,56 @@ bool initFontsAndAssets(std::string& foldermain) {
 	return true;
 }
 
+static std::string toLower(const std::string& s) {
+	std::string out;
+	out.reserve(s.size());
+	for (unsigned char c : s)
+		out += (char)((c >= 'A' && c <= 'Z') ? c + 32 : c);
+	return out;
+}
+
+static void rebuildSearchFilter() {
+	arraymain_filtered.clear();
+	arraymain_is_dir_filtered.clear();
+	if (g_search_filter.empty()) return;
+	std::string needle = toLower(g_search_filter);
+	for (size_t i = 0; i < arraymain.size(); i++) {
+		if (toLower(arraymain[i]).find(needle) != std::string::npos) {
+			arraymain_filtered.push_back(arraymain[i]);
+			arraymain_is_dir_filtered.push_back(arraymain_is_dir[i]);
+		}
+	}
+	size_t n = arraymain_filtered.size();
+	if (n == 0) { selectchapter = 0; baseymain = 30; }
+	else if ((size_t)selectchapter >= n) {
+		selectchapter = (int)n - 1;
+		baseymain = 30 - 20 * ((int)n - 1);
+	}
+}
+
+static size_t getMangaListCount() {
+	return g_search_filter.empty() ? arraymain.size() : arraymain_filtered.size();
+}
+static const std::string& getMangaName(size_t i) {
+	size_t n = getMangaListCount();
+	if (i >= n) {
+		static const std::string empty;
+		return empty;
+	}
+	return g_search_filter.empty() ? arraymain[i] : arraymain_filtered[i];
+}
+static bool getMangaIsDir(size_t i) {
+	size_t n = getMangaListCount();
+	if (i >= n) return false;
+	return g_search_filter.empty() ? arraymain_is_dir[i] : arraymain_is_dir_filtered[i];
+}
+
 void loadFolderList(const std::string& foldermain) {
 	arraymain.clear();
 	arraymain_is_dir.clear();
+	g_search_filter.clear();
+	arraymain_filtered.clear();
+	arraymain_is_dir_filtered.clear();
 	DIR* dirmain;
 	struct dirent* entmain;
 	if ((dirmain = opendir(foldermain.c_str())) != NULL) {
@@ -984,7 +1061,6 @@ std::string gethtml(std::string enlace)
 {
 
 	CURL *curl;
-	CURLcode res;
 	std::string Buffer;
 
 	curl = curl_easy_init();
@@ -997,7 +1073,7 @@ std::string gethtml(std::string enlace)
 		curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
 		curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
 		curl_easy_setopt(curl, CURLOPT_WRITEDATA, &Buffer);
-		res = curl_easy_perform(curl);
+		curl_easy_perform(curl);
 		curl_easy_cleanup(curl);
 		return Buffer;
 	}
@@ -1008,7 +1084,6 @@ void downloadfile(std::string enlace, std::string directorydown)
 	
 	CURL *curl;
 	FILE *fp;
-	CURLcode res;
 
 	curl = curl_easy_init();
 	if (curl) {
@@ -1024,7 +1099,7 @@ void downloadfile(std::string enlace, std::string directorydown)
 		curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
 		// Install the callback function
 		curl_easy_setopt(curl, CURLOPT_PROGRESSFUNCTION, progress_func);
-		res = curl_easy_perform(curl);
+		curl_easy_perform(curl);
 		/* always cleanup */
 		curl_easy_cleanup(curl);
 		fclose(fp);
@@ -1060,7 +1135,7 @@ void handleSwitchInput(u64 kDown, u64 kHeld) {
 		switch (statenow) {
 		case selectmanga:
 			g_cbz_open_error_msg.clear();
-			if (selectchapter < (int)arraymain.size() - 1) {
+			if (selectchapter < (int)getMangaListCount() - 1) {
 				selectchapter++;
 				baseymain = baseymain - 20;
 			} else {
@@ -1095,8 +1170,9 @@ void handleSwitchInput(u64 kDown, u64 kHeld) {
 				selectchapter--;
 				baseymain = baseymain + 20;
 			} else {
-				baseymain = 30 - 20 * ((int)arraymain.size() - 1);
-				selectchapter = (int)arraymain.size() - 1;
+				size_t n = getMangaListCount();
+				baseymain = (n > 0) ? (30 - 20 * ((int)n - 1)) : 30;
+				selectchapter = (n > 0) ? (int)n - 1 : 0;
 			}
 			break;
 		}
@@ -1173,11 +1249,14 @@ void handleSwitchInput(u64 kDown, u64 kHeld) {
 				if (cascade == false) { basey = 0; adjust = !adjust; }
 				else adjust = !adjust;
 				break;
-			case selectmanga:
-				if (selectchapter < (int)arraymain_is_dir.size() && !arraymain_is_dir[selectchapter]) {
+			case selectmanga: {
+				size_t n = getMangaListCount();
+				if (n == 0 || selectchapter < 0 || (size_t)selectchapter >= n)
+					break;
+				if (!getMangaIsDir((size_t)selectchapter)) {
 					g_cbz_open_error = CBZ_ERR_NONE;
 					g_cbz_open_error_msg.clear();
-					std::string fname = arraymain[selectchapter];
+					std::string fname = getMangaName((size_t)selectchapter);
 					size_t start = fname.find_first_not_of(" \t\r\n");
 					size_t end = fname.find_last_not_of(" \t\r\n");
 					if (start != std::string::npos) fname = (end != std::string::npos) ? fname.substr(start, end - start + 1) : fname.substr(start);
@@ -1212,51 +1291,36 @@ void handleSwitchInput(u64 kDown, u64 kHeld) {
 					}
 					break;
 				}
-				{
-					std::string foldertoread = g_foldermain + arraymain[selectchapter] + "/";
-					arraychapter.clear();
-					DIR* dir; struct dirent* ent;
-					if ((dir = opendir(foldertoread.c_str())) != NULL) {
-						while ((ent = readdir(dir)) != NULL) {
-							if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
-							std::string namefile(ent->d_name);
-							if (namefile.find(".jpg") != std::string::npos || namefile.find(".jpeg") != std::string::npos ||
-								namefile.find(".png") != std::string::npos || namefile.find(".bmp") != std::string::npos ||
-								namefile.find(".gif") != std::string::npos || namefile.find(".webp") != std::string::npos)
-								arraychapter.push_back(foldertoread + namefile);
-						}
-						std::sort(arraychapter.begin(), arraychapter.end(), naturalSortCompare);
-						closedir(dir);
+				std::string foldertoread = g_foldermain + getMangaName((size_t)selectchapter) + "/";
+				arraychapter.clear();
+				DIR* dir; struct dirent* ent;
+				if ((dir = opendir(foldertoread.c_str())) != NULL) {
+					while ((ent = readdir(dir)) != NULL) {
+						if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
+						std::string namefile(ent->d_name);
+						if (namefile.find(".jpg") != std::string::npos || namefile.find(".jpeg") != std::string::npos ||
+							namefile.find(".png") != std::string::npos || namefile.find(".bmp") != std::string::npos ||
+							namefile.find(".gif") != std::string::npos || namefile.find(".webp") != std::string::npos)
+							arraychapter.push_back(foldertoread + namefile);
 					}
-					if (arraychapter.size() > 0) {
-						int savedPage = loadReadingProgress(g_foldermain, foldertoread);
-						if (savedPage >= 0 && savedPage < (int)arraychapter.size()) selectpage = savedPage;
-						loadPageIntoTexture(arraychapter[selectpage], &Pagemanga);
-						arraypage.resize(arraychapter.size());
-						if (cascadeactivated)
-							for (size_t x = 0; x < arraychapter.size(); x++)
-								loadPageIntoTexture(arraychapter[x], &arraypage[x]);
-						statenow = readmanga;
-						helppage = true;
-					}
+					std::sort(arraychapter.begin(), arraychapter.end(), naturalSortCompare);
+					closedir(dir);
 				}
-				break;
-			}
+				if (arraychapter.size() > 0) {
+					int savedPage = loadReadingProgress(g_foldermain, foldertoread);
+					if (savedPage >= 0 && savedPage < (int)arraychapter.size()) selectpage = savedPage;
+					loadPageIntoTexture(arraychapter[selectpage], &Pagemanga);
+					arraypage.resize(arraychapter.size());
+					if (cascadeactivated)
+						for (size_t x = 0; x < arraychapter.size(); x++)
+							loadPageIntoTexture(arraychapter[x], &arraypage[x]);
+					statenow = readmanga;
+					helppage = true;
+				}
+			break;
+		}
 		}
 	}
-	if (kDown & HidNpadButton_X) {
-		switch (statenow) {
-		case readmanga:
-			if (cascadeactivated) {
-				if (cascademode < 2) cascademode++;
-				else cascademode = 0;
-				if (cascademode == 1) { separation = false; cascade = true; }
-				if (cascademode == 2) { cascade = true; separation = true; }
-				if (cascademode == 0) { cascade = false; separation = false; basex = 0; basey = 0; }
-			}
-			break;
-		case selectmanga: cascadeactivated = !cascadeactivated; break;
-		}
 	}
 	if (kDown & HidNpadButton_StickL) {
 		switch (statenow) {
@@ -1275,13 +1339,48 @@ void handleSwitchInput(u64 kDown, u64 kHeld) {
 			cascade = false; separation = false; adjust = true;
 			basex = 0; basey = 0; neutralsize = 1; zoom = 1; selectpage = 0;
 			break;
-		case selectmanga: break;
+		case selectmanga: {
+			const char* result = Keyboard_GetTextSearch("Search: type name or pattern", g_search_filter.c_str());
+			g_search_filter = result ? result : "";
+			rebuildSearchFilter();
+			break;
+		}
 		}
 	}
 }
 #endif
 
 void handlePCInput(SDL_Event& e) {
+#ifndef __SWITCH__
+	if (g_search_input_mode) {
+		if (e.type == SDL_KEYDOWN) {
+			if (e.key.keysym.sym == SDLK_ESCAPE) {
+				g_search_filter.clear();
+				rebuildSearchFilter();
+				g_search_input_mode = false;
+				SDL_StopTextInput();
+				return;
+			}
+			if (e.key.keysym.sym == SDLK_RETURN || e.key.keysym.sym == SDLK_KP_ENTER) {
+				g_search_input_mode = false;
+				SDL_StopTextInput();
+				return;
+			}
+			if (e.key.keysym.sym == SDLK_BACKSPACE) {
+				if (!g_search_filter.empty()) {
+					g_search_filter.pop_back();
+					rebuildSearchFilter();
+				}
+				return;
+			}
+		}
+		if (e.type == SDL_TEXTINPUT) {
+			g_search_filter += e.text.text;
+			rebuildSearchFilter();
+		}
+		return;
+	}
+#endif
 	if (e.type == SDL_QUIT) { cancelcurl = 1; quit = 1; }
 	else if (e.type == SDL_KEYDOWN) {
 		switch (e.key.keysym.sym) {
@@ -1297,7 +1396,7 @@ void handlePCInput(SDL_Event& e) {
 				break;
 			case selectmanga:
 				g_cbz_open_error_msg.clear();
-				if (selectchapter < (int)arraymain.size() - 1) {
+				if (selectchapter < (int)getMangaListCount() - 1) {
 					selectchapter++; baseymain = baseymain - 20;
 				} else { selectchapter = 0; baseymain = 30; }
 				break;
@@ -1315,7 +1414,11 @@ void handlePCInput(SDL_Event& e) {
 			case selectmanga:
 				g_cbz_open_error_msg.clear();
 				if (selectchapter > 0) { selectchapter--; baseymain = baseymain + 20; }
-				else { baseymain = 30 - 20 * ((int)arraymain.size() - 1); selectchapter = (int)arraymain.size() - 1; }
+				else {
+					size_t n = getMangaListCount();
+					baseymain = (n > 0) ? (30 - 20 * ((int)n - 1)) : 30;
+					selectchapter = (n > 0) ? (int)n - 1 : 0;
+				}
 				break;
 			}
 			break;
@@ -1325,10 +1428,13 @@ void handlePCInput(SDL_Event& e) {
 				case readmanga:
 					if (cascade == false) { basey = 0; adjust = !adjust; } else adjust = !adjust;
 					break;
-				case selectmanga:
-					if (selectchapter < (int)arraymain_is_dir.size() && !arraymain_is_dir[selectchapter]) {
+				case selectmanga: {
+					size_t n = getMangaListCount();
+					if (n == 0 || selectchapter < 0 || (size_t)selectchapter >= n)
+						break;
+					if (!getMangaIsDir((size_t)selectchapter)) {
 						g_cbz_open_error = CBZ_ERR_NONE; g_cbz_open_error_msg.clear();
-						std::string fname = arraymain[selectchapter];
+						std::string fname = getMangaName((size_t)selectchapter);
 						size_t start = fname.find_first_not_of(" \t\r\n");
 						size_t end = fname.find_last_not_of(" \t\r\n");
 						if (start != std::string::npos) fname = (end != std::string::npos) ? fname.substr(start, end - start + 1) : fname.substr(start);
@@ -1356,33 +1462,32 @@ void handlePCInput(SDL_Event& e) {
 						}
 						break;
 					}
-					{
-						std::string foldertoread = g_foldermain + arraymain[selectchapter] + "/";
-						arraychapter.clear();
-						DIR* dir; struct dirent* ent;
-						if ((dir = opendir(foldertoread.c_str())) != NULL) {
-							while ((ent = readdir(dir)) != NULL) {
-								if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
-								std::string namefile(ent->d_name);
-								if (namefile.find(".jpg") != std::string::npos || namefile.find(".jpeg") != std::string::npos ||
-									namefile.find(".png") != std::string::npos || namefile.find(".bmp") != std::string::npos ||
-									namefile.find(".gif") != std::string::npos || namefile.find(".webp") != std::string::npos)
-									arraychapter.push_back(foldertoread + namefile);
-							}
-							std::sort(arraychapter.begin(), arraychapter.end(), naturalSortCompare);
-							closedir(dir);
+					std::string foldertoread = g_foldermain + getMangaName((size_t)selectchapter) + "/";
+					arraychapter.clear();
+					DIR* dir; struct dirent* ent;
+					if ((dir = opendir(foldertoread.c_str())) != NULL) {
+						while ((ent = readdir(dir)) != NULL) {
+							if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
+							std::string namefile(ent->d_name);
+							if (namefile.find(".jpg") != std::string::npos || namefile.find(".jpeg") != std::string::npos ||
+								namefile.find(".png") != std::string::npos || namefile.find(".bmp") != std::string::npos ||
+								namefile.find(".gif") != std::string::npos || namefile.find(".webp") != std::string::npos)
+								arraychapter.push_back(foldertoread + namefile);
 						}
-						if (arraychapter.size() > 0) {
-							int savedPage = loadReadingProgress(g_foldermain, foldertoread);
-							if (savedPage >= 0 && savedPage < (int)arraychapter.size()) selectpage = savedPage;
-							loadPageIntoTexture(arraychapter[selectpage], &Pagemanga);
-							arraypage.resize(arraychapter.size());
-							if (cascadeactivated) for (size_t x = 0; x < arraychapter.size(); x++) loadPageIntoTexture(arraychapter[x], &arraypage[x]);
-							statenow = readmanga; helppage = true;
-						}
+						std::sort(arraychapter.begin(), arraychapter.end(), naturalSortCompare);
+						closedir(dir);
+					}
+					if (arraychapter.size() > 0) {
+						int savedPage = loadReadingProgress(g_foldermain, foldertoread);
+						if (savedPage >= 0 && savedPage < (int)arraychapter.size()) selectpage = savedPage;
+						loadPageIntoTexture(arraychapter[selectpage], &Pagemanga);
+						arraypage.resize(arraychapter.size());
+						if (cascadeactivated) for (size_t x = 0; x < arraychapter.size(); x++) loadPageIntoTexture(arraychapter[x], &arraypage[x]);
+						statenow = readmanga; helppage = true;
 					}
 					break;
 				}
+			}
 			}
 			break;
 		case SDLK_MINUS: if (statenow == readmanga && neutralsize > 0.05f) neutralsize -= 0.05f; break;
@@ -1405,7 +1510,12 @@ void handlePCInput(SDL_Event& e) {
 				cascade = false; separation = false; adjust = true;
 				basex = 0; basey = 0; neutralsize = 1; zoom = 1; selectpage = 0;
 				break;
-			case selectmanga: break;
+			case selectmanga:
+#ifndef __SWITCH__
+				g_search_input_mode = true;
+				SDL_StartTextInput();
+#endif
+				break;
 			}
 			break;
 		case SDLK_l:
@@ -1427,19 +1537,6 @@ void handlePCInput(SDL_Event& e) {
 					if (selectpage < (int)arraychapter.size() - 1) { selectpage++; g_pending_page_load = true; }
 				} else zoom = 1;
 				break;
-			}
-			break;
-		case SDLK_x:
-			switch (statenow) {
-			case readmanga:
-				if (cascadeactivated) {
-					if (cascademode < 2) cascademode++; else cascademode = 0;
-					if (cascademode == 1) { separation = false; cascade = true; }
-					if (cascademode == 2) { cascade = true; separation = true; }
-					if (cascademode == 0) { cascade = false; separation = false; basex = 0; basey = 0; }
-				}
-				break;
-			case selectmanga: cascadeactivated = !cascadeactivated; break;
 			}
 			break;
 		case SDLK_w:
@@ -1568,14 +1665,18 @@ void renderFrame() {
 			gTextTexture.loadFromRenderedText(gFont3, "in a folder without Latin characters.", { 0, 0, 0 });
 			gTextTexture.render(g_view_w / 2 - gTextTexture.getWidth() / 2, 160);
 		}
-		for (size_t x = 0; x < arraymain.size(); x++) {
-			if ((int)x == selectchapter) {
-				Heart.render(basexmain + 12, baseymain + ((int)x * 22));
-				gTextTexture.loadFromRenderedText(gFont, arraymain[x], { 120, 120, 120 });
-				gTextTexture.render(basexmain + 30, baseymain + ((int)x * 22));
-			} else {
-				gTextTexture.loadFromRenderedText(gFont, arraymain[x], { 50, 50, 50 });
-				gTextTexture.render(basexmain, baseymain + ((int)x * 22));
+		{
+			size_t listCount = getMangaListCount();
+			for (size_t x = 0; x < listCount; x++) {
+				int ypos = baseymain + ((int)x * 22);
+				if ((int)x == selectchapter) {
+					Heart.render(basexmain + 12, ypos);
+					gTextTexture.loadFromRenderedText(gFont, getMangaName(x), { 120, 120, 120 });
+					gTextTexture.render(basexmain + 30, ypos);
+				} else {
+					gTextTexture.loadFromRenderedText(gFont, getMangaName(x), { 50, 50, 50 });
+					gTextTexture.render(basexmain, ypos);
+				}
 			}
 		}
 		{
@@ -1588,20 +1689,39 @@ void renderFrame() {
 			gTextTexture.loadFromRenderedText(gFont, g_cbz_open_error_msg.c_str(), textColor);
 			gTextTexture.render(basexmain, g_view_h - 30);
 		} else {
-			bool sel_is_archive = (selectchapter < (int)arraymain_is_dir.size() && !arraymain_is_dir[selectchapter]);
+			bool sel_is_archive = (selectchapter < (int)getMangaListCount() && !getMangaIsDir((size_t)selectchapter));
 			if (sel_is_archive) {
-				std::string name = (selectchapter < (int)arraymain.size()) ? arraymain[selectchapter] : "";
+				std::string name = (selectchapter < (int)getMangaListCount()) ? getMangaName((size_t)selectchapter) : "";
 				bool is_cbz = (name.size() >= 4 && name.compare(name.size() - 4, 4, ".cbz") == 0);
-				gTextTexture.loadFromRenderedText(gFont, is_cbz ? "CBZ selected - press \"A\" to read. " : "Folder - press \"A\" to open. ", textColor);
+				gTextTexture.loadFromRenderedText(gFont, is_cbz ? "Press \"A\" to read. Press \"B\" to search. " : "Press \"A\" to open. Press \"B\" to search. ", textColor);
 				gTextTexture.render(basexmain, g_view_h - 30);
 			} else if (!cascadeactivated)
-				gTextTexture.loadFromRenderedText(gFont, "\"A\" to read folder - \"X\" for Enable Cascade Mode (Load slow and High Memory use). ", textColor);
+				gTextTexture.loadFromRenderedText(gFont, "Press \"A\" to read folder. Press \"B\" to search. ", textColor);
 			else
-				gTextTexture.loadFromRenderedText(gFont, "\"A\" to read folder - \"X\" for Disable Cascade Mode (Instant load and Low Memory use). ", textColor);
+				gTextTexture.loadFromRenderedText(gFont, "Press \"A\" to read folder. Press \"B\" to search. ", textColor);
 			gTextTexture.render(basexmain, g_view_h - 30);
 		}
 		break;
 	}
+#ifndef __SWITCH__
+	// PC: modal search dialog when typing
+	if (g_search_input_mode && statenow == selectmanga) {
+		SDL_Rect overlay = { 0, 0, g_view_w, g_view_h };
+		SDL_SetRenderDrawColor(gRenderer, 0, 0, 0, 180);
+		SDL_RenderFillRect(gRenderer, &overlay);
+		int boxW = 400, boxH = 80, boxX = (g_view_w - boxW) / 2, boxY = (g_view_h - boxH) / 2;
+		SDL_Rect box = { boxX, boxY, boxW, boxH };
+		SDL_SetRenderDrawColor(gRenderer, 255, 255, 255, 255);
+		SDL_RenderFillRect(gRenderer, &box);
+		SDL_SetRenderDrawColor(gRenderer, 100, 100, 100, 255);
+		SDL_RenderDrawRect(gRenderer, &box);
+		std::string prompt = "Search: " + g_search_filter + "|";
+		gTextTexture.loadFromRenderedText(gFont, prompt.c_str(), { 50, 50, 50 });
+		gTextTexture.render(boxX + 8, boxY + (boxH - gTextTexture.getHeight()) / 2);
+		gTextTexture.loadFromRenderedText(gFont, "Enter = done, Escape = cancel", { 80, 80, 80 });
+		gTextTexture.render(boxX + 8, boxY + boxH - 18);
+	}
+#endif
 	if (g_portrait_mode && g_portrait_texture != NULL) {
 		SDL_SetRenderTarget(gRenderer, NULL);
 		SDL_SetRenderDrawColor(gRenderer, 0, 0, 0, 255);
