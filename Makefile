@@ -99,6 +99,14 @@ $(error MuPDF not found. Clone and build it first (from project root): \
   git clone --depth 1 https://github.com/ArtifexSoftware/mupdf.git libs/mupdf && make -C libs -f Makefile.mupdf)
 endif
 LIBDIRS	:= $(PORTLIBS) $(LIBNX) $(MUPDF_ROOT)
+# Optional CBR support (RAR comic archives): clone unarr and run make -C libs -f Makefile.unarr
+UNARR_ROOT := $(TOPDIR)/libs/unarr
+ifneq (,$(wildcard $(UNARR_ROOT)/lib/libunarr.a))
+LIBDIRS	+= $(UNARR_ROOT)
+LIBS	+= -lunarr
+CFLAGS	+= -DCBR_SUPPORT
+CXXFLAGS	+= -DCBR_SUPPORT
+endif
 
 
 #---------------------------------------------------------------------------------

@@ -1,0 +1,40 @@
+# Build unarr for Nintendo Switch (used by CuteManga for CBR support).
+# Prerequisites: unarr source in libs/unarr (e.g. git clone https://github.com/selmf/unarr.git libs/unarr)
+# Run from project root: make -C libs -f Makefile.unarr
+# Or from libs: make -f Makefile.unarr
+#
+# Requires: DEVKITPRO and PORTLIBS (devkitA64 + switch portlibs with zlib).
+
+ifeq ($(strip $(DEVKITPRO)),)
+$(error "Set DEVKITPRO. Run from devkitPro MSYS or: export DEVKITPRO=/opt/devkitpro")
+endif
+
+TOPDIR ?= $(CURDIR)/..
+UNARR_SRC := $(TOPDIR)/libs/unarr
+UNARR_BUILD := $(UNARR_SRC)/build-switch
+UNARR_OUT_LIB := $(UNARR_SRC)/lib
+UNARR_OUT_INC := $(UNARR_SRC)/include
+
+.PHONY: unarr
+
+unarr:
+	@if [ ! -d "$(UNARR_SRC)" ] || [ ! -f "$(UNARR_SRC)/CMakeLists.txt" ]; then \
+		echo "unarr source not found."; \
+		echo "From project root run:"; \
+		echo "  git clone https://github.com/selmf/unarr.git libs/unarr"; \
+		exit 1; \
+	fi
+	@echo "Building unarr for Switch..."
+	@mkdir -p $(UNARR_BUILD) $(UNARR_OUT_LIB) $(UNARR_OUT_INC)
+	cd $(UNARR_BUILD) && UNARR_STUB_INCLUDE="$(TOPDIR)/libs/unarr-stub" cmake $(UNARR_SRC) \
+		-DCMAKE_TOOLCHAIN_FILE=$(TOPDIR)/libs/devkitA64.cmake \
+		-DBUILD_SHARED_LIBS=OFF \
+		-DENABLE_7Z=OFF \
+		-DUSE_SYSTEM_ZLIB=ON \
+		-DUSE_SYSTEM_BZ2=OFF \
+		-DUSE_SYSTEM_LZMA=OFF \
+		-DCMAKE_BUILD_TYPE=Release
+	$(MAKE) -C $(UNARR_BUILD) unarr
+	@cp -f $(UNARR_BUILD)/libunarr.a $(UNARR_OUT_LIB)/ 2>/dev/null || true
+	@cp -f $(UNARR_BUILD)/unarr.h $(UNARR_OUT_INC)/ 2>/dev/null || true
+	@test -f $(UNARR_OUT_LIB)/libunarr.a && echo "unarr built. lib: $(UNARR_OUT_LIB)/libunarr.a" || (echo "Build may have failed. Check $(UNARR_BUILD)."; exit 1)

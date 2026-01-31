@@ -210,11 +210,15 @@ void close();
 // When true, footer shows "Loading" and we load the page after the frame
 bool g_pending_page_load = false;
 
-// CBZ open failure reason for UI
-enum { CBZ_ERR_NONE = 0, CBZ_ERR_FILE_NOT_FOUND = 1, CBZ_ERR_NOT_ZIP = 2 };
+// CBZ/CBR open failure reason for UI
+enum { CBZ_ERR_NONE = 0, CBZ_ERR_FILE_NOT_FOUND = 1, CBZ_ERR_NOT_ZIP = 2, CBZ_ERR_NOT_RAR = 3 };
 int g_cbz_open_error = CBZ_ERR_NONE;
 std::string g_cbz_mupdf_error;  // MuPDF error message when CBZ_ERR_NOT_ZIP
 std::string g_cbz_open_error_msg;  // Message to show in selectmanga footer on open failure
+
+#ifdef CBR_SUPPORT
+#include <unarr.h>
+#endif
 
 void renderLoadingScreen();  // Full-screen "Loading" then present (for CBZ open)
 
@@ -228,6 +232,14 @@ void renderFrame();
 fz_context* g_mupdf_ctx = NULL;
 fz_document* g_mupdf_doc = NULL;
 std::string g_mupdf_path;
+
+#ifdef CBR_SUPPORT
+// unarr: current CBR archive (open while viewing)
+ar_stream* g_cbr_stream = NULL;
+ar_archive* g_cbr_archive = NULL;
+std::string g_cbr_path;
+std::vector<int64_t> g_cbr_page_offsets;  // ar_entry_get_offset per page (off64_t)
+#endif
 
 //The window we'll be rendering to
 SDL_Window* gWindow = NULL;
@@ -558,6 +570,9 @@ static bool naturalSortCompare(const std::string& a, const std::string& b) {
 	return (i >= a.size() && j < b.size());
 }
 
+#ifdef CBR_SUPPORT
+static void closeCbr();  // forward decl for openCbzWithMupdf
+#endif
 // Open CBZ with MuPDF; sets g_mupdf_doc and g_mupdf_path. Returns page count or -1 on error.
 static int openCbzWithMupdf(const char* cbzPath) {
 	g_cbz_open_error = CBZ_ERR_NONE;
@@ -565,6 +580,9 @@ static int openCbzWithMupdf(const char* cbzPath) {
 	if (!g_mupdf_ctx) return -1;
 	if (g_mupdf_doc) { fz_drop_document(g_mupdf_ctx, g_mupdf_doc); g_mupdf_doc = NULL; }
 	g_mupdf_path.clear();
+#ifdef CBR_SUPPORT
+	closeCbr();
+#endif
 	const char* pathToOpen = cbzPath;
 #ifdef __SWITCH__
 	FILE* test = fopen(cbzPath, "rb");
@@ -643,7 +661,96 @@ static bool loadCbzPageIntoTexture(const char* cbzPath, int pageIndex, LTexture*
 	return ok;
 }
 
-// Load a page from arraychapter entry (file path or "cbz:path:pageIndex")
+//-----------------------------------------------------------------------------
+// CBR support via unarr (RAR comic archives) - optional when CBR_SUPPORT defined
+//-----------------------------------------------------------------------------
+#ifdef CBR_SUPPORT
+static void closeCbr() {
+	if (g_cbr_archive) { ar_close_archive(g_cbr_archive); g_cbr_archive = NULL; }
+	if (g_cbr_stream) { ar_close(g_cbr_stream); g_cbr_stream = NULL; }
+	g_cbr_path.clear();
+	g_cbr_page_offsets.clear();
+}
+
+static bool isImageFilename(const std::string& name) {
+	std::string lower = name;
+	for (size_t i = 0; i < lower.size(); i++)
+		if (lower[i] >= 'A' && lower[i] <= 'Z') lower[i] += 32;
+	return lower.find(".jpg") != std::string::npos || lower.find(".jpeg") != std::string::npos ||
+		lower.find(".png") != std::string::npos || lower.find(".bmp") != std::string::npos ||
+		lower.find(".gif") != std::string::npos || lower.find(".webp") != std::string::npos;
+}
+
+// Open CBR with unarr; sets g_cbr_*. Returns page count or -1 on error.
+static int openCbrWithUnarr(const char* cbrPath) {
+	g_cbz_open_error = CBZ_ERR_NONE;
+	g_cbz_open_error_msg.clear();
+	closeCbr();
+	const char* pathToOpen = cbrPath;
+#ifdef __SWITCH__
+	FILE* test = fopen(cbrPath, "rb");
+	if (test) {
+		fclose(test);
+		pathToOpen = cbrPath;
+	} else if (strncmp(cbrPath, "sdmc:/", 6) == 0) {
+		test = fopen(cbrPath + 6, "rb");
+		if (!test) { g_cbz_open_error = CBZ_ERR_FILE_NOT_FOUND; return -1; }
+		fclose(test);
+		pathToOpen = cbrPath + 6;
+	} else {
+		g_cbz_open_error = CBZ_ERR_FILE_NOT_FOUND;
+		return -1;
+	}
+#endif
+	g_cbr_stream = ar_open_file(pathToOpen);
+	if (!g_cbr_stream) { g_cbz_open_error = CBZ_ERR_FILE_NOT_FOUND; return -1; }
+	g_cbr_archive = ar_open_rar_archive(g_cbr_stream);
+	if (!g_cbr_archive) {
+		ar_close(g_cbr_stream);
+		g_cbr_stream = NULL;
+		g_cbz_open_error = CBZ_ERR_NOT_RAR;
+		g_cbz_open_error_msg = "Not a valid CBR (RAR) file.";
+		return -1;
+	}
+	std::vector<std::pair<std::string, int64_t>> entries;
+	while (ar_parse_entry(g_cbr_archive)) {
+		const char* n = ar_entry_get_name(g_cbr_archive);
+		if (!n) continue;
+		std::string name(n);
+		if (isImageFilename(name))
+			entries.push_back(std::make_pair(name, (int64_t)ar_entry_get_offset(g_cbr_archive)));
+	}
+	std::sort(entries.begin(), entries.end(),
+		[](const std::pair<std::string, int64_t>& a, const std::pair<std::string, int64_t>& b) {
+			return naturalSortCompare(a.first, b.first);
+		});
+	g_cbr_page_offsets.clear();
+	for (size_t i = 0; i < entries.size(); i++)
+		g_cbr_page_offsets.push_back(entries[i].second);
+	g_cbr_path = cbrPath;
+	return (int)g_cbr_page_offsets.size();
+}
+
+static int listPagesFromCbr(const char* cbrPath) {
+	return openCbrWithUnarr(cbrPath);
+}
+
+static bool loadCbrPageIntoTexture(const char* cbrPath, int pageIndex, LTexture* tex) {
+	if (!g_cbr_archive || g_cbr_path != cbrPath || pageIndex < 0 || (size_t)pageIndex >= g_cbr_page_offsets.size())
+		return false;
+	if (!ar_parse_entry_at(g_cbr_archive, (off64_t)g_cbr_page_offsets[pageIndex]))
+		return false;
+	size_t sz = ar_entry_get_size(g_cbr_archive);
+	void* buf = malloc(sz);
+	if (!buf) return false;
+	bool ok = ar_entry_uncompress(g_cbr_archive, buf, sz);
+	if (ok) tex->loadFromMemory(buf, (int)sz);
+	free(buf);
+	return ok;
+}
+#endif
+
+// Load a page from arraychapter entry (file path or "cbz:path:pageIndex" or "cbr:path:pageIndex")
 static void loadPageIntoTexture(const std::string& entry, LTexture* tex) {
 	if (entry.size() > 4 && entry.compare(0, 4, "cbz:") == 0) {
 		size_t lastColon = entry.rfind(':');
@@ -654,6 +761,17 @@ static void loadPageIntoTexture(const std::string& entry, LTexture* tex) {
 			return;
 		}
 	}
+#ifdef CBR_SUPPORT
+	if (entry.size() > 4 && entry.compare(0, 4, "cbr:") == 0) {
+		size_t lastColon = entry.rfind(':');
+		if (lastColon != std::string::npos && lastColon > 4) {
+			std::string path = entry.substr(4, lastColon - 4);
+			int pageIndex = atoi(entry.substr(lastColon + 1).c_str());
+			loadCbrPageIntoTexture(path.c_str(), pageIndex, tex);
+			return;
+		}
+	}
+#endif
 	tex->loadFromFile(entry);
 }
 
@@ -666,7 +784,7 @@ extern std::vector<std::string> arraychapter;  // defined later in file
 static std::string getCurrentMangaPath() {
 	if (arraychapter.empty()) return "";
 	const std::string& first = arraychapter[0];
-	if (first.size() > 4 && first.compare(0, 4, "cbz:") == 0) {
+	if (first.size() > 4 && (first.compare(0, 4, "cbz:") == 0 || first.compare(0, 4, "cbr:") == 0)) {
 		size_t lastColon = first.rfind(':');
 		if (lastColon != std::string::npos && lastColon > 4)
 			return first.substr(4, lastColon - 4);
@@ -901,7 +1019,11 @@ void loadFolderList(const std::string& foldermain) {
 				if (stat(fullpath.c_str(), &st) == 0)
 					is_dir = S_ISDIR(st.st_mode);
 			}
-			bool is_archive = (name.size() >= 4 && name.compare(name.size() - 4, 4, ".cbz") == 0);
+			bool is_archive = (name.size() >= 4 && name.compare(name.size() - 4, 4, ".cbz") == 0)
+#ifdef CBR_SUPPORT
+				|| (name.size() >= 4 && name.compare(name.size() - 4, 4, ".cbr") == 0)
+#endif
+				;
 			if (is_dir || is_archive) {
 				printf("%s\n", entmain->d_name);
 				entries.push_back(std::make_pair(name, is_dir));
@@ -1264,6 +1386,34 @@ void handleSwitchInput(u64 kDown, u64 kHeld) {
 					for (size_t i = 0; i < archPath.size(); i++)
 						if (archPath[i] == '\\') archPath[i] = '/';
 					renderLoadingScreen();
+#ifdef CBR_SUPPORT
+					bool isCbr = (fname.size() >= 4 && fname.compare(fname.size() - 4, 4, ".cbr") == 0);
+					if (isCbr) {
+						int pageCount = listPagesFromCbr(archPath.c_str());
+						if (pageCount <= 0) {
+							if (g_cbz_open_error == CBZ_ERR_FILE_NOT_FOUND)
+								g_cbz_open_error_msg = "File not found. Put CBR in sdmc:/CuteManga/";
+							else if (g_cbz_open_error == CBZ_ERR_NOT_RAR)
+								g_cbz_open_error_msg = "Not a valid CBR (RAR) file.";
+							else g_cbz_open_error_msg = "No pages in CBR.";
+						} else {
+							arraychapter.clear();
+							for (int i = 0; i < pageCount; i++)
+								arraychapter.push_back(std::string("cbr:") + archPath + ":" + std::to_string(i));
+							selectpage = 0;
+							int savedPage = loadReadingProgress(g_foldermain, archPath);
+							if (savedPage >= 0 && savedPage < pageCount) selectpage = savedPage;
+							bool ok = loadCbrPageIntoTexture(archPath.c_str(), selectpage, &Pagemanga);
+							arraypage.resize(arraychapter.size());
+							if (cascadeactivated) {
+								for (int x = 0; x < pageCount; x++)
+									loadCbrPageIntoTexture(archPath.c_str(), x, &arraypage[x]);
+							}
+							if (ok) { statenow = readmanga; helppage = true; }
+						}
+						break;
+					}
+#endif
 					int pageCount = listPagesFromCbz(archPath.c_str());
 					if (pageCount <= 0) {
 						if (g_cbz_open_error == CBZ_ERR_FILE_NOT_FOUND)
@@ -1334,6 +1484,9 @@ void handleSwitchInput(u64 kDown, u64 kHeld) {
 			statenow = selectmanga;
 			if (g_mupdf_doc && g_mupdf_ctx) { fz_drop_document(g_mupdf_ctx, g_mupdf_doc); g_mupdf_doc = NULL; }
 			g_mupdf_path.clear();
+#ifdef CBR_SUPPORT
+			closeCbr();
+#endif
 			Pagemanga.free();
 			for (size_t x = 0; x < arraypage.size(); x++) arraypage[x].free();
 			cascade = false; separation = false; adjust = true;
@@ -1441,6 +1594,28 @@ void handlePCInput(SDL_Event& e) {
 						std::string archPath = g_foldermain + fname;
 						for (size_t i = 0; i < archPath.size(); i++) if (archPath[i] == '\\') archPath[i] = '/';
 						renderLoadingScreen();
+#ifdef CBR_SUPPORT
+						bool isCbr = (fname.size() >= 4 && fname.compare(fname.size() - 4, 4, ".cbr") == 0);
+						if (isCbr) {
+							int pageCount = listPagesFromCbr(archPath.c_str());
+							if (pageCount <= 0) {
+								if (g_cbz_open_error == CBZ_ERR_FILE_NOT_FOUND) g_cbz_open_error_msg = "File not found. Put CBR in sdmc:/CuteManga/";
+								else if (g_cbz_open_error == CBZ_ERR_NOT_RAR) g_cbz_open_error_msg = "Not a valid CBR (RAR) file.";
+								else g_cbz_open_error_msg = "No pages in CBR.";
+							} else {
+								arraychapter.clear();
+								for (int i = 0; i < pageCount; i++) arraychapter.push_back(std::string("cbr:") + archPath + ":" + std::to_string(i));
+								selectpage = 0;
+								int savedPage = loadReadingProgress(g_foldermain, archPath);
+								if (savedPage >= 0 && savedPage < pageCount) selectpage = savedPage;
+								bool ok = loadCbrPageIntoTexture(archPath.c_str(), selectpage, &Pagemanga);
+								arraypage.resize(arraychapter.size());
+								if (cascadeactivated) for (int x = 0; x < pageCount; x++) loadCbrPageIntoTexture(archPath.c_str(), x, &arraypage[x]);
+								if (ok) { statenow = readmanga; helppage = true; }
+							}
+							break;
+						}
+#endif
 						int pageCount = listPagesFromCbz(archPath.c_str());
 						if (pageCount <= 0) {
 							if (g_cbz_open_error == CBZ_ERR_FILE_NOT_FOUND) g_cbz_open_error_msg = "File not found. Put CBZ in sdmc:/CuteManga/";
@@ -1505,6 +1680,9 @@ void handlePCInput(SDL_Event& e) {
 				statenow = selectmanga;
 				if (g_mupdf_doc && g_mupdf_ctx) { fz_drop_document(g_mupdf_ctx, g_mupdf_doc); g_mupdf_doc = NULL; }
 				g_mupdf_path.clear();
+#ifdef CBR_SUPPORT
+				closeCbr();
+#endif
 				Pagemanga.free();
 				for (size_t x = 0; x < arraypage.size(); x++) arraypage[x].free();
 				cascade = false; separation = false; adjust = true;
@@ -1693,7 +1871,13 @@ void renderFrame() {
 			if (sel_is_archive) {
 				std::string name = (selectchapter < (int)getMangaListCount()) ? getMangaName((size_t)selectchapter) : "";
 				bool is_cbz = (name.size() >= 4 && name.compare(name.size() - 4, 4, ".cbz") == 0);
-				gTextTexture.loadFromRenderedText(gFont, is_cbz ? "Press \"A\" to read. Press \"B\" to search. " : "Press \"A\" to open. Press \"B\" to search. ", textColor);
+#ifdef CBR_SUPPORT
+				bool is_cbr = (name.size() >= 4 && name.compare(name.size() - 4, 4, ".cbr") == 0);
+				bool is_archive_read = is_cbz || is_cbr;
+#else
+				bool is_archive_read = is_cbz;
+#endif
+				gTextTexture.loadFromRenderedText(gFont, is_archive_read ? "Press \"A\" to read. Press \"B\" to search. " : "Press \"A\" to open. Press \"B\" to search. ", textColor);
 				gTextTexture.render(basexmain, g_view_h - 30);
 			} else if (!cascadeactivated)
 				gTextTexture.loadFromRenderedText(gFont, "Press \"A\" to read folder. Press \"B\" to search. ", textColor);
