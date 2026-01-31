@@ -2,7 +2,7 @@
 
 A manga and comic reader for **Nintendo Switch** (homebrew). Read **CBZ** (ZIP), **CBR** (RAR), **PDF** comics and image-based manga from your SD card in landscape or portrait, with zoom and cascade viewing.
 
-**Version:** 1.0.6 (see [Releases](https://github.com/pinheiroam/CuteManga/releases) for builds)
+**Version:** 1.0.7 (see [Releases](https://github.com/pinheiroam/CuteManga/releases) for builds)
 
 ---
 
