@@ -802,7 +802,7 @@ static void loadPageIntoTexture(const std::string& entry, LTexture* tex) {
 
 //-----------------------------------------------------------------------------
 // Reading progress: one file (reading_progress.txt) stores each manga's
-// last page; one line per manga: "path\tpage\n". Save on page change, restore on open.
+// last page and total pages; one line: "path\tpage\ttotal\n". Save on page change.
 // Uses static buffer (not stack) for devkitA64 / limited stack.
 //-----------------------------------------------------------------------------
 extern std::vector<std::string> arraychapter;  // defined later in file
@@ -824,7 +824,7 @@ static std::string getCurrentMangaPath() {
 #define READING_PROGRESS_MAX_ENTRIES 64
 #define READING_PROGRESS_MAX_PATH 384
 
-// Returns saved page index (0-based) or -1 if not found.
+// Returns saved page index (0-based) or -1 if not found. (Total pages not returned; use getStoredProgress for display.)
 static int loadReadingProgress(const std::string& foldermain, const std::string& mangaPath) {
 	char pathbuf[READING_PROGRESS_MAX_PATH];
 	size_t flen = foldermain.size();
@@ -847,11 +847,39 @@ static int loadReadingProgress(const std::string& foldermain, const std::string&
 	return page;
 }
 
-// Static buffer so we don't use ~25KB+ stack (Switch has limited stack).
-static struct { char path[READING_PROGRESS_MAX_PATH]; int page; } s_progress_entries[READING_PROGRESS_MAX_ENTRIES];
+// Returns true if path found and sets *outPage (0-based) and *outTotal. Old format (no total) sets *outTotal = 0.
+static bool getStoredProgress(const std::string& foldermain, const std::string& mangaPath, int* outPage, int* outTotal) {
+	char pathbuf[READING_PROGRESS_MAX_PATH];
+	size_t flen = foldermain.size();
+	if (flen + 24 >= sizeof(pathbuf) || !outPage || !outTotal) return false;
+	memcpy(pathbuf, foldermain.c_str(), flen + 1);
+	strcat(pathbuf, "reading_progress.txt");
+	FILE* f = fopen(pathbuf, "r");
+	if (!f) return false;
+	char line[1024];
+	bool found = false;
+	while (fgets(line, (int)sizeof(line), f)) {
+		char* tab = strchr(line, '\t');
+		if (!tab) continue;
+		*tab = '\0';
+		if (strcmp(line, mangaPath.c_str()) == 0) {
+			*outPage = atoi(tab + 1);
+			char* tab2 = strchr(tab + 1, '\t');
+			*outTotal = (tab2 && tab2[1]) ? atoi(tab2 + 1) : 0;
+			found = true;
+			break;
+		}
+		*tab = '\t';
+	}
+	fclose(f);
+	return found;
+}
 
-// Updates progress: read all entries, update this manga's page, write all back.
-static void saveReadingProgress(const std::string& foldermain, const std::string& mangaPath, int pageIndex) {
+// Static buffer so we don't use ~25KB+ stack (Switch has limited stack).
+static struct { char path[READING_PROGRESS_MAX_PATH]; int page; int total; } s_progress_entries[READING_PROGRESS_MAX_ENTRIES];
+
+// Updates progress: read all entries, update this manga's page and total, write all back.
+static void saveReadingProgress(const std::string& foldermain, const std::string& mangaPath, int pageIndex, int totalPages) {
 	char pathbuf[READING_PROGRESS_MAX_PATH];
 	size_t flen = foldermain.size();
 	if (flen + 24 >= sizeof(pathbuf)) return;
@@ -869,6 +897,8 @@ static void saveReadingProgress(const std::string& foldermain, const std::string
 			if (plen >= (size_t)READING_PROGRESS_MAX_PATH) { *tab = '\t'; continue; }
 			memcpy(s_progress_entries[n_entries].path, line, plen + 1);
 			s_progress_entries[n_entries].page = atoi(tab + 1);
+			char* tab2 = strchr(tab + 1, '\t');
+			s_progress_entries[n_entries].total = (tab2 && tab2[1]) ? atoi(tab2 + 1) : 0;
 			n_entries++;
 			*tab = '\t';
 		}
@@ -878,18 +908,20 @@ static void saveReadingProgress(const std::string& foldermain, const std::string
 	for (int i = 0; i < n_entries; i++) {
 		if (strcmp(s_progress_entries[i].path, mangaPath.c_str()) == 0) { found = i; break; }
 	}
-	if (found >= 0)
+	if (found >= 0) {
 		s_progress_entries[found].page = pageIndex;
-	else if (n_entries < READING_PROGRESS_MAX_ENTRIES && (int)mangaPath.size() < READING_PROGRESS_MAX_PATH) {
+		s_progress_entries[found].total = totalPages;
+	} else if (n_entries < READING_PROGRESS_MAX_ENTRIES && (int)mangaPath.size() < READING_PROGRESS_MAX_PATH) {
 		strncpy(s_progress_entries[n_entries].path, mangaPath.c_str(), READING_PROGRESS_MAX_PATH - 1);
 		s_progress_entries[n_entries].path[READING_PROGRESS_MAX_PATH - 1] = '\0';
 		s_progress_entries[n_entries].page = pageIndex;
+		s_progress_entries[n_entries].total = totalPages;
 		n_entries++;
 	}
 	f = fopen(pathbuf, "w");
 	if (!f) return;
 	for (int j = 0; j < n_entries; j++)
-		fprintf(f, "%s\t%d\n", s_progress_entries[j].path, s_progress_entries[j].page);
+		fprintf(f, "%s\t%d\t%d\n", s_progress_entries[j].path, s_progress_entries[j].page, s_progress_entries[j].total);
 	fclose(f);
 }
 
@@ -1075,7 +1107,7 @@ void doDeferredPageLoad(const std::string& foldermain) {
 	loadPageIntoTexture(arraychapter[selectpage], &Pagemanga);
 	std::string mangaPath = getCurrentMangaPath();
 	if (!mangaPath.empty())
-		saveReadingProgress(foldermain, mangaPath, selectpage);
+		saveReadingProgress(foldermain, mangaPath, selectpage, (int)arraychapter.size());
 	g_pending_page_load = false;
 }
 
@@ -1509,7 +1541,7 @@ void handleSwitchInput(u64 kDown, u64 kHeld) {
 								for (int x = 0; x < pageCount; x++)
 									loadCbrPageIntoTexture(archPath.c_str(), x, &arraypage[x]);
 							}
-							if (ok) { statenow = readmanga; helppage = true; }
+							if (ok) { statenow = readmanga; helppage = true; saveReadingProgress(g_foldermain, archPath, selectpage, pageCount); }
 						}
 						break;
 					}
@@ -1536,7 +1568,7 @@ void handleSwitchInput(u64 kDown, u64 kHeld) {
 								for (int x = 0; x < pageCount; x++)
 									loadCbzPageIntoTexture(archPath.c_str(), x, &arraypage[x]);
 							}
-							if (ok) { statenow = readmanga; helppage = true; }
+							if (ok) { statenow = readmanga; helppage = true; saveReadingProgress(g_foldermain, archPath, selectpage, pageCount); }
 						}
 						break;
 					}
@@ -1563,7 +1595,7 @@ void handleSwitchInput(u64 kDown, u64 kHeld) {
 							for (int x = 0; x < pageCount; x++)
 								loadCbzPageIntoTexture(archPath.c_str(), x, &arraypage[x]);
 						}
-						if (ok) { statenow = readmanga; helppage = true; }
+						if (ok) { statenow = readmanga; helppage = true; saveReadingProgress(g_foldermain, archPath, selectpage, (int)arraychapter.size()); }
 					}
 					break;
 				}
@@ -1592,6 +1624,7 @@ void handleSwitchInput(u64 kDown, u64 kHeld) {
 							loadPageIntoTexture(arraychapter[x], &arraypage[x]);
 					statenow = readmanga;
 					helppage = true;
+					saveReadingProgress(g_foldermain, foldertoread, selectpage, (int)arraychapter.size());
 				}
 			break;
 		}
@@ -1792,7 +1825,7 @@ void handlePCInput(SDL_Event& e) {
 								bool ok = loadCbrPageIntoTexture(archPath.c_str(), selectpage, &Pagemanga);
 								arraypage.resize(arraychapter.size());
 								if (cascadeactivated) for (int x = 0; x < pageCount; x++) loadCbrPageIntoTexture(archPath.c_str(), x, &arraypage[x]);
-								if (ok) { statenow = readmanga; helppage = true; }
+								if (ok) { statenow = readmanga; helppage = true; saveReadingProgress(g_foldermain, archPath, selectpage, pageCount); }
 							}
 							break;
 						}
@@ -1813,7 +1846,7 @@ void handlePCInput(SDL_Event& e) {
 								bool ok = loadCbzPageIntoTexture(archPath.c_str(), selectpage, &Pagemanga);
 								arraypage.resize(arraychapter.size());
 								if (cascadeactivated) for (int x = 0; x < pageCount; x++) loadCbzPageIntoTexture(archPath.c_str(), x, &arraypage[x]);
-								if (ok) { statenow = readmanga; helppage = true; }
+								if (ok) { statenow = readmanga; helppage = true; saveReadingProgress(g_foldermain, archPath, selectpage, pageCount); }
 							}
 							break;
 						}
@@ -1834,7 +1867,7 @@ void handlePCInput(SDL_Event& e) {
 							bool ok = loadCbzPageIntoTexture(archPath.c_str(), selectpage, &Pagemanga);
 							arraypage.resize(arraychapter.size());
 							if (cascadeactivated) for (int x = 0; x < pageCount; x++) loadCbzPageIntoTexture(archPath.c_str(), x, &arraypage[x]);
-							if (ok) { statenow = readmanga; helppage = true; }
+							if (ok) { statenow = readmanga; helppage = true; saveReadingProgress(g_foldermain, archPath, selectpage, (int)arraychapter.size()); }
 						}
 						break;
 					}
@@ -1860,6 +1893,7 @@ void handlePCInput(SDL_Event& e) {
 						arraypage.resize(arraychapter.size());
 						if (cascadeactivated) for (size_t x = 0; x < arraychapter.size(); x++) loadPageIntoTexture(arraychapter[x], &arraypage[x]);
 						statenow = readmanga; helppage = true;
+						saveReadingProgress(g_foldermain, foldertoread, selectpage, (int)arraychapter.size());
 					}
 					break;
 				}
@@ -2051,13 +2085,26 @@ void renderFrame() {
 			SDL_Rect listClip = { 0, LIST_TOP, g_view_w, list_view_h };
 			SDL_RenderSetClipRect(gRenderer, &listClip);
 			for (size_t x = 0; x < listCount; x++) {
+				std::string displayName = getMangaName(x);
+				std::string path = g_foldermain + displayName;
+				if (getMangaIsDir(x)) path += "/";
+				int progPage = -1, progTotal = 0;
+				if (getStoredProgress(g_foldermain, path, &progPage, &progTotal)) {
+					if (progTotal > 0 && progPage == progTotal - 1)
+						displayName += " (completed)";
+					else if (progTotal > 0) {
+						int pct = (int)((progPage + 1) * 100 / progTotal);
+						if (pct > 100) pct = 100;
+						displayName += " (" + std::to_string(pct) + " pct)";
+					}
+				}
 				int ypos = baseymain + (int)x * LIST_LINE_HEIGHT;
 				if ((int)x == selectchapter) {
 					Heart.render(basexmain + 12, ypos);
-					gTextTexture.loadFromRenderedText(gFont, getMangaName(x), { 120, 120, 120 });
+					gTextTexture.loadFromRenderedText(gFont, displayName, { 120, 120, 120 });
 					gTextTexture.render(basexmain + 30, ypos);
 				} else {
-					gTextTexture.loadFromRenderedText(gFont, getMangaName(x), { 50, 50, 50 });
+					gTextTexture.loadFromRenderedText(gFont, displayName, { 50, 50, 50 });
 					gTextTexture.render(basexmain, ypos);
 				}
 			}

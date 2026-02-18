@@ -32,7 +32,7 @@ include $(DEVKITPRO)/libnx/switch_rules
 #---------------------------------------------------------------------------------
 VERSION_MAJOR := 1
 VERSION_MINOR := 0
-VERSION_MICRO := 7
+VERSION_MICRO := 8
 
 APP_TITLE	:=	CuteManga
 APP_AUTHOR	:=	AngelXex and pinheiroam
